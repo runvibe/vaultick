@@ -1386,6 +1386,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "rsa",
+ "serde_json",
  "ssh-key",
  "tempfile",
  "vaultick-lib",

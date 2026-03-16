@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::rngs::OsRng;
 use rsa::BigUint;
@@ -354,7 +354,13 @@ impl Vaultick {
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|err| VaultickError::Crypto(format!("invalid data encryption key: {err}")))?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), value)
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: value,
+                    aad: secret_key_aad(&key),
+                },
+            )
             .map_err(|err| VaultickError::Crypto(format!("failed to encrypt secret: {err}")))?;
 
         let wrapped_keys = public_keys
@@ -475,7 +481,10 @@ impl Vaultick {
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(secret.nonce.as_slice()),
-                secret.ciphertext.as_ref(),
+                Payload {
+                    msg: secret.ciphertext.as_ref(),
+                    aad: secret_key_aad(key),
+                },
             )
             .map_err(|err| VaultickError::Crypto(format!("failed to decrypt secret: {err}")))?;
         Ok(plaintext)
@@ -897,6 +906,10 @@ fn normalize_secret_key(key: &str) -> Result<String> {
     }
 
     Ok(normalized)
+}
+
+fn secret_key_aad(key: &str) -> &[u8] {
+    key.as_bytes()
 }
 
 fn wrap_secret_key(public_key: &RsaPublicKey, dek: &[u8]) -> Result<Vec<u8>> {
@@ -1351,6 +1364,35 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(decrypted, payload);
         assert!(
             matches!(err, VaultickError::Crypto(message) if message.contains("not valid UTF-8"))
+        );
+    }
+
+    #[test]
+    fn renaming_secret_key_breaks_decryption_because_key_name_is_authenticated() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        let metadata = store
+            .set_secret("team-a", "api-key", "secret-1", false)
+            .unwrap();
+
+        store
+            .conn
+            .borrow()
+            .execute(
+                "UPDATE secrets SET key = ?1 WHERE id = ?2",
+                params!["RENAMED_KEY", metadata.id],
+            )
+            .unwrap();
+
+        let err = store
+            .get_secret("team-a", "RENAMED_KEY", KEY_1)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VaultickError::Crypto(message) if message.contains("failed to decrypt secret"))
         );
     }
 

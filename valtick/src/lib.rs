@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS secret_recipients (
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
 
-pub type Result<T> = std::result::Result<T, ValtickError>;
+pub type Result<T> = std::result::Result<T, VaultickError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
@@ -94,7 +94,7 @@ pub struct SecretMetadata {
 }
 
 #[derive(Debug, Error)]
-pub enum ValtickError {
+pub enum VaultickError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
     #[error("crypto error: {0}")]
@@ -144,22 +144,22 @@ struct ParsedCertificate {
     fingerprint_sha256: String,
 }
 
-pub struct Valtick {
+pub struct Vaultick {
     conn: RefCell<Connection>,
 }
 
-impl Valtick {
+impl Vaultick {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let is_new_database = !path.exists() || path == Path::new(":memory:");
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let valtick = Self {
+        let vaultick = Self {
             conn: RefCell::new(conn),
         };
-        valtick.init_schema(is_new_database)?;
-        Ok(valtick)
+        vaultick.init_schema(is_new_database)?;
+        Ok(vaultick)
     }
 
     pub fn create_workspace(&self, name: &str) -> Result<Workspace> {
@@ -181,7 +181,7 @@ impl Valtick {
         let rows = stmt.query_map([], workspace_from_row)?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 
     pub fn get_workspace(&self, workspace_ref: &str) -> Result<Workspace> {
@@ -220,7 +220,7 @@ impl Valtick {
         )?;
 
         if secret_count > 0 && !existing_certs.is_empty() && rewrap_private_key_pem.is_none() {
-            return Err(ValtickError::Validation(
+            return Err(VaultickError::Validation(
                 "rewrap private key is required when adding a certificate to a workspace with existing secrets"
                     .to_string(),
             ));
@@ -298,7 +298,7 @@ impl Valtick {
         )?;
 
         if would_orphan {
-            return Err(ValtickError::CertificateInUse);
+            return Err(VaultickError::CertificateInUse);
         }
 
         tx.execute(
@@ -314,14 +314,26 @@ impl Valtick {
         workspace_ref: &str,
         key: &str,
         value: &str,
+        overwrite: bool,
     ) -> Result<SecretMetadata> {
+        self.set_secret_bytes(workspace_ref, key, value.as_bytes(), overwrite)
+    }
+
+    pub fn set_secret_bytes(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        value: &[u8],
+        overwrite: bool,
+    ) -> Result<SecretMetadata> {
+        let key = normalize_secret_key(key)?;
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         let workspace = Self::resolve_workspace(&tx, workspace_ref)?;
         let certificates = Self::list_certificates_for_workspace(&tx, &workspace.id)?;
 
         if certificates.is_empty() {
-            return Err(ValtickError::WorkspaceHasNoCertificates);
+            return Err(VaultickError::WorkspaceHasNoCertificates);
         }
 
         let public_keys = certificates
@@ -340,23 +352,28 @@ impl Valtick {
         rng.fill_bytes(&mut nonce);
 
         let cipher = Aes256Gcm::new_from_slice(&dek)
-            .map_err(|err| ValtickError::Crypto(format!("invalid data encryption key: {err}")))?;
+            .map_err(|err| VaultickError::Crypto(format!("invalid data encryption key: {err}")))?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), value.as_bytes())
-            .map_err(|err| ValtickError::Crypto(format!("failed to encrypt secret: {err}")))?;
+            .encrypt(Nonce::from_slice(&nonce), value)
+            .map_err(|err| VaultickError::Crypto(format!("failed to encrypt secret: {err}")))?;
 
         let wrapped_keys = public_keys
             .iter()
             .map(|public_key| wrap_secret_key(public_key, &dek))
             .collect::<Result<Vec<_>>>()?;
 
-        let existing_secret = Self::find_secret_by_key(&tx, &workspace.id, key)?;
+        let existing_secret = Self::find_secret_by_key(&tx, &workspace.id, &key)?;
         let secret_id = existing_secret
             .as_ref()
             .map(|secret| secret.metadata.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         if existing_secret.is_some() {
+            if !overwrite {
+                return Err(VaultickError::Validation(format!(
+                    "secret already exists in workspace: {key}; use --overwrite to update it"
+                )));
+            }
             tx.execute(
                 "UPDATE secrets
                  SET nonce = ?1,
@@ -391,7 +408,7 @@ impl Valtick {
             )?;
         }
 
-        let metadata = Self::resolve_secret_metadata(&tx, &workspace.id, key)?;
+        let metadata = Self::resolve_secret_metadata(&tx, &workspace.id, &key)?;
         tx.commit()?;
         Ok(metadata)
     }
@@ -402,8 +419,20 @@ impl Valtick {
         key: &str,
         private_key_pem: &str,
     ) -> Result<String> {
+        let plaintext = self.get_secret_bytes(workspace_ref, key, private_key_pem)?;
+        String::from_utf8(plaintext)
+            .map_err(|err| VaultickError::Crypto(format!("secret is not valid UTF-8: {err}")))
+    }
+
+    pub fn get_secret_bytes(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        private_key_pem: &str,
+    ) -> Result<Vec<u8>> {
         let private_key = parse_private_key(private_key_pem)?;
-        self.decrypt_secret_with_private_key(workspace_ref, key, &private_key)
+        let key = normalize_secret_key(key)?;
+        self.decrypt_secret_with_private_key(workspace_ref, &key, &private_key)
     }
 
     pub fn get_secret_auto<P: AsRef<Path>>(
@@ -417,16 +446,23 @@ impl Valtick {
         self.get_secret(workspace_ref, key, &private_key_pem)
     }
 
+    pub fn get_secret_metadata(&self, workspace_ref: &str, key: &str) -> Result<SecretMetadata> {
+        let key = normalize_secret_key(key)?;
+        let conn = self.conn.borrow();
+        let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
+        Self::resolve_secret_metadata(&conn, &workspace.id, &key)
+    }
+
     fn decrypt_secret_with_private_key(
         &self,
         workspace_ref: &str,
         key: &str,
         private_key: &RsaPrivateKey,
-    ) -> Result<String> {
+    ) -> Result<Vec<u8>> {
         let conn = self.conn.borrow();
         let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
         let secret = Self::find_secret_by_key(&conn, &workspace.id, key)?.ok_or_else(|| {
-            ValtickError::NotFound {
+            VaultickError::NotFound {
                 entity: "secret",
                 reference: key.to_string(),
             }
@@ -435,16 +471,14 @@ impl Valtick {
         let dek = unwrap_secret_key(private_key, &recipients)?;
 
         let cipher = Aes256Gcm::new_from_slice(&dek)
-            .map_err(|err| ValtickError::Crypto(format!("invalid data encryption key: {err}")))?;
+            .map_err(|err| VaultickError::Crypto(format!("invalid data encryption key: {err}")))?;
         let plaintext = cipher
             .decrypt(
                 Nonce::from_slice(secret.nonce.as_slice()),
                 secret.ciphertext.as_ref(),
             )
-            .map_err(|err| ValtickError::Crypto(format!("failed to decrypt secret: {err}")))?;
-
-        String::from_utf8(plaintext)
-            .map_err(|err| ValtickError::Crypto(format!("secret is not valid UTF-8: {err}")))
+            .map_err(|err| VaultickError::Crypto(format!("failed to decrypt secret: {err}")))?;
+        Ok(plaintext)
     }
 
     fn resolve_auto_private_key_pem_for_workspace<P: AsRef<Path>>(
@@ -457,7 +491,7 @@ impl Valtick {
         let candidates = discover_secret_get_private_key_candidates(ssh_dir, &certificates);
 
         if candidates.is_empty() {
-            return Err(ValtickError::AutoPrivateKeyLookup(format!(
+            return Err(VaultickError::AutoPrivateKeyLookup(format!(
                 "no private key matching any certificate label was found in {}, and {} was not available; define --private-key",
                 ssh_dir.display(),
                 ssh_dir.join(DEFAULT_SSH_PRIVATE_KEY_NAME).display()
@@ -504,7 +538,7 @@ impl Valtick {
             }
         }
 
-        Err(ValtickError::AutoPrivateKeyLookup(format!(
+        Err(VaultickError::AutoPrivateKeyLookup(format!(
             "automatic private key lookup failed. Tried {}. define --private-key",
             attempted.join("; ")
         )))
@@ -521,17 +555,18 @@ impl Valtick {
         )?;
         let rows = stmt.query_map(params![workspace.id], secret_metadata_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 
     pub fn delete_secret(&self, workspace_ref: &str, key: &str) -> Result<()> {
+        let key = normalize_secret_key(key)?;
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
         let workspace = Self::resolve_workspace(&tx, workspace_ref)?;
-        let secret = Self::find_secret_by_key(&tx, &workspace.id, key)?.ok_or_else(|| {
-            ValtickError::NotFound {
+        let secret = Self::find_secret_by_key(&tx, &workspace.id, &key)?.ok_or_else(|| {
+            VaultickError::NotFound {
                 entity: "secret",
-                reference: key.to_string(),
+                reference: key.clone(),
             }
         })?;
         tx.execute(
@@ -573,7 +608,7 @@ impl Valtick {
         )?;
         stmt.query_row(params![workspace_ref], workspace_from_row)
             .optional()?
-            .ok_or_else(|| ValtickError::NotFound {
+            .ok_or_else(|| VaultickError::NotFound {
                 entity: "workspace",
                 reference: workspace_ref.to_string(),
             })
@@ -594,7 +629,7 @@ impl Valtick {
         )?;
         stmt.query_row(params![workspace_id, cert_ref], certificate_from_row)
             .optional()?
-            .ok_or_else(|| ValtickError::NotFound {
+            .ok_or_else(|| VaultickError::NotFound {
                 entity: "certificate",
                 reference: cert_ref.to_string(),
             })
@@ -613,7 +648,7 @@ impl Valtick {
         )?;
         stmt.query_row(params![workspace_id, key], secret_metadata_from_row)
             .optional()?
-            .ok_or_else(|| ValtickError::NotFound {
+            .ok_or_else(|| VaultickError::NotFound {
                 entity: "secret",
                 reference: key.to_string(),
             })
@@ -631,7 +666,7 @@ impl Valtick {
         )?;
         let rows = stmt.query_map(params![workspace_id], certificate_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 
     fn find_secret_by_key(
@@ -647,7 +682,7 @@ impl Valtick {
         )?;
         stmt.query_row(params![workspace_id, key], secret_record_from_row)
             .optional()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 
     fn list_secret_records_for_workspace(
@@ -662,7 +697,7 @@ impl Valtick {
         )?;
         let rows = stmt.query_map(params![workspace_id], secret_record_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 
     fn list_secret_recipients(conn: &Connection, secret_id: &str) -> Result<Vec<SecretRecipient>> {
@@ -677,7 +712,7 @@ impl Valtick {
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(ValtickError::from)
+            .map_err(VaultickError::from)
     }
 }
 
@@ -729,7 +764,7 @@ fn parse_public_material(input: &str) -> Result<ParsedCertificate> {
         let der_bytes = pem.contents.as_bytes();
         if let Ok((_, cert)) = X509Certificate::from_der(der_bytes) {
             let public_key = RsaPublicKey::from_public_key_der(cert.public_key().raw)
-                .map_err(|err| ValtickError::InvalidCertificate(err.to_string()))?;
+                .map_err(|err| VaultickError::InvalidCertificate(err.to_string()))?;
             return build_parsed_certificate(public_key);
         }
     }
@@ -742,7 +777,7 @@ fn parse_public_material(input: &str) -> Result<ParsedCertificate> {
         return build_parsed_certificate(public_key);
     }
 
-    Err(ValtickError::InvalidCertificate(
+    Err(VaultickError::InvalidCertificate(
         "expected an RSA X.509 certificate or RSA public key PEM".to_string(),
     ))
 }
@@ -757,15 +792,14 @@ fn parse_private_key(private_key_pem: &str) -> Result<RsaPrivateKey> {
     }
 
     if let Ok(ssh_key) = SshPrivateKey::from_openssh(private_key_pem) {
-        let rsa_keypair = ssh_key
-            .key_data()
-            .rsa()
-            .ok_or_else(|| ValtickError::InvalidPrivateKey("private key is not RSA".to_string()))?;
+        let rsa_keypair = ssh_key.key_data().rsa().ok_or_else(|| {
+            VaultickError::InvalidPrivateKey("private key is not RSA".to_string())
+        })?;
 
         return ssh_rsa_keypair_to_private_key(rsa_keypair);
     }
 
-    Err(ValtickError::InvalidPrivateKey(
+    Err(VaultickError::InvalidPrivateKey(
         "expected an RSA private key in PKCS#1, PKCS#8, or OpenSSH format".to_string(),
     ))
 }
@@ -773,7 +807,7 @@ fn parse_private_key(private_key_pem: &str) -> Result<RsaPrivateKey> {
 fn build_parsed_certificate(public_key: RsaPublicKey) -> Result<ParsedCertificate> {
     let der = public_key
         .to_public_key_der()
-        .map_err(|err| ValtickError::InvalidCertificate(err.to_string()))?;
+        .map_err(|err| VaultickError::InvalidCertificate(err.to_string()))?;
 
     Ok(ParsedCertificate {
         public_key,
@@ -784,19 +818,19 @@ fn build_parsed_certificate(public_key: RsaPublicKey) -> Result<ParsedCertificat
 fn ssh_rsa_keypair_to_private_key(keypair: &ssh_key::private::RsaKeypair) -> Result<RsaPrivateKey> {
     RsaPrivateKey::from_components(
         BigUint::try_from(&keypair.public.n)
-            .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))?,
+            .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))?,
         BigUint::try_from(&keypair.public.e)
-            .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))?,
+            .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))?,
         BigUint::try_from(&keypair.private.d)
-            .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))?,
+            .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))?,
         vec![
             BigUint::try_from(&keypair.private.p)
-                .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))?,
+                .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))?,
             BigUint::try_from(&keypair.private.q)
-                .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))?,
+                .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))?,
         ],
     )
-    .map_err(|err| ValtickError::InvalidPrivateKey(err.to_string()))
+    .map_err(|err| VaultickError::InvalidPrivateKey(err.to_string()))
 }
 
 fn discover_label_private_key_candidates(
@@ -842,11 +876,11 @@ fn discover_secret_get_private_key_candidates(
     candidates
 }
 
-fn summarize_secret_lookup_error(err: &ValtickError) -> String {
+fn summarize_secret_lookup_error(err: &VaultickError) -> String {
     match err {
-        ValtickError::IncompatiblePrivateKey => "private key did not match the secret".to_string(),
-        ValtickError::InvalidPrivateKey(message) => format!("invalid private key: {message}"),
-        ValtickError::NotFound {
+        VaultickError::IncompatiblePrivateKey => "private key did not match the secret".to_string(),
+        VaultickError::InvalidPrivateKey(message) => format!("invalid private key: {message}"),
+        VaultickError::NotFound {
             entity: "secret",
             reference,
         } => format!("secret not found: {reference}"),
@@ -854,11 +888,22 @@ fn summarize_secret_lookup_error(err: &ValtickError) -> String {
     }
 }
 
+fn normalize_secret_key(key: &str) -> Result<String> {
+    let normalized = key.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(VaultickError::Validation(
+            "secret key cannot be empty".to_string(),
+        ));
+    }
+
+    Ok(normalized)
+}
+
 fn wrap_secret_key(public_key: &RsaPublicKey, dek: &[u8]) -> Result<Vec<u8>> {
     let mut rng = OsRng;
     public_key
         .encrypt(&mut rng, Oaep::new::<Sha256>(), dek)
-        .map_err(|err| ValtickError::Crypto(format!("failed to wrap secret key: {err}")))
+        .map_err(|err| VaultickError::Crypto(format!("failed to wrap secret key: {err}")))
 }
 
 fn unwrap_secret_key(
@@ -871,15 +916,15 @@ fn unwrap_secret_key(
         }
     }
 
-    Err(ValtickError::IncompatiblePrivateKey)
+    Err(VaultickError::IncompatiblePrivateKey)
 }
 
-fn map_constraint(err: rusqlite::Error, message: String) -> ValtickError {
+fn map_constraint(err: rusqlite::Error, message: String) -> VaultickError {
     match &err {
         rusqlite::Error::SqliteFailure(code, _) if code.code == ErrorCode::ConstraintViolation => {
-            ValtickError::Validation(message)
+            VaultickError::Validation(message)
         }
-        _ => ValtickError::Database(err),
+        _ => VaultickError::Database(err),
     }
 }
 
@@ -1087,7 +1132,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .add_certificate("team-a", "primary", "not-a-cert", None)
             .unwrap_err();
 
-        assert!(matches!(err, ValtickError::InvalidCertificate(_)));
+        assert!(matches!(err, VaultickError::InvalidCertificate(_)));
     }
 
     #[test]
@@ -1099,7 +1144,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .unwrap();
 
         store
-            .set_secret("team-a", "api-key", "super-secret")
+            .set_secret("team-a", "api-key", "super-secret", false)
             .unwrap();
         let value = store.get_secret("team-a", "api-key", KEY_1).unwrap();
 
@@ -1114,12 +1159,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
         store
-            .set_secret("team-a", "api-key", "super-secret")
+            .set_secret("team-a", "api-key", "super-secret", false)
             .unwrap();
 
         let err = store.get_secret("team-a", "api-key", KEY_2).unwrap_err();
 
-        assert!(matches!(err, ValtickError::IncompatiblePrivateKey));
+        assert!(matches!(err, VaultickError::IncompatiblePrivateKey));
     }
 
     #[test]
@@ -1134,7 +1179,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .unwrap();
 
         store
-            .set_secret("team-a", "api-key", "shared-secret")
+            .set_secret("team-a", "api-key", "shared-secret", false)
             .unwrap();
 
         assert_eq!(
@@ -1155,7 +1200,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
         store
-            .set_secret("team-a", "api-key", "legacy-secret")
+            .set_secret("team-a", "api-key", "legacy-secret", false)
             .unwrap();
 
         store
@@ -1173,9 +1218,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let (_dir, store) = new_store();
         store.create_workspace("team-a").unwrap();
 
-        let err = store.set_secret("team-a", "api-key", "secret").unwrap_err();
+        let err = store
+            .set_secret("team-a", "api-key", "secret", false)
+            .unwrap_err();
 
-        assert!(matches!(err, ValtickError::WorkspaceHasNoCertificates));
+        assert!(matches!(err, VaultickError::WorkspaceHasNoCertificates));
     }
 
     #[test]
@@ -1185,13 +1232,15 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let certificate = store
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
-        store.set_secret("team-a", "api-key", "secret").unwrap();
+        store
+            .set_secret("team-a", "api-key", "secret", false)
+            .unwrap();
 
         let err = store
             .delete_certificate("team-a", &certificate.id)
             .unwrap_err();
 
-        assert!(matches!(err, ValtickError::CertificateInUse));
+        assert!(matches!(err, VaultickError::CertificateInUse));
     }
 
     #[test]
@@ -1202,9 +1251,13 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
 
-        let first = store.set_secret("team-a", "api-key", "secret-1").unwrap();
+        let first = store
+            .set_secret("team-a", "api-key", "secret-1", false)
+            .unwrap();
         thread::sleep(Duration::from_millis(10));
-        let second = store.set_secret("team-a", "api-key", "secret-2").unwrap();
+        let second = store
+            .set_secret("team-a", "api-key", "secret-2", true)
+            .unwrap();
         let listed = store.list_secrets("team-a").unwrap();
 
         assert_eq!(first.id, second.id);
@@ -1213,6 +1266,91 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(
             store.get_secret("team-a", "api-key", KEY_1).unwrap(),
             "secret-2"
+        );
+    }
+
+    #[test]
+    fn set_secret_rejects_overwrite_without_flag() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        store
+            .set_secret("team-a", "api-key", "secret-1", false)
+            .unwrap();
+
+        let err = store
+            .set_secret("team-a", "api-key", "secret-2", false)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VaultickError::Validation(message) if message.contains("--overwrite"))
+        );
+    }
+
+    #[test]
+    fn get_secret_metadata_returns_single_secret_metadata() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        let created = store
+            .set_secret("team-a", "api-key", "secret-1", false)
+            .unwrap();
+
+        let fetched = store.get_secret_metadata("team-a", "Api-Key").unwrap();
+
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.workspace_id, created.workspace_id);
+        assert_eq!(fetched.key, "API-KEY");
+        assert_eq!(fetched.created_at, created.created_at);
+        assert_eq!(fetched.updated_at, created.updated_at);
+    }
+
+    #[test]
+    fn secret_keys_are_normalized_to_uppercase_and_are_case_insensitive() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+
+        let metadata = store
+            .set_secret("team-a", "google_token", "secret-1", false)
+            .unwrap();
+        let fetched = store.get_secret_metadata("team-a", "GoOgLe_ToKeN").unwrap();
+        let decrypted = store.get_secret("team-a", "gOoGlE_tOkEn", KEY_1).unwrap();
+
+        assert_eq!(metadata.key, "GOOGLE_TOKEN");
+        assert_eq!(fetched.key, "GOOGLE_TOKEN");
+        assert_eq!(decrypted, "secret-1");
+    }
+
+    #[test]
+    fn binary_secret_roundtrip_works_with_bytes_api() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+
+        let payload = vec![0x00, 0x9f, 0xff, 0x41, 0x42];
+        store
+            .set_secret_bytes("team-a", "binary_blob", &payload, false)
+            .unwrap();
+
+        let decrypted = store
+            .get_secret_bytes("team-a", "BINARY_BLOB", KEY_1)
+            .unwrap();
+        let err = store
+            .get_secret("team-a", "BINARY_BLOB", KEY_1)
+            .unwrap_err();
+
+        assert_eq!(decrypted, payload);
+        assert!(
+            matches!(err, VaultickError::Crypto(message) if message.contains("not valid UTF-8"))
         );
     }
 
@@ -1229,7 +1367,9 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         store
             .add_certificate("team-a", "ssh", public_key_pem.as_str(), None)
             .unwrap();
-        store.set_secret("team-a", "api-key", "ssh-secret").unwrap();
+        store
+            .set_secret("team-a", "api-key", "ssh-secret", false)
+            .unwrap();
 
         assert_eq!(
             store
@@ -1254,7 +1394,9 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         store
             .add_certificate("default", "id_rsa", public_key_pem.as_str(), None)
             .unwrap();
-        store.set_secret("default", "API_KEY", "value").unwrap();
+        store
+            .set_secret("default", "API_KEY", "value", false)
+            .unwrap();
 
         let value = store
             .get_secret_auto("default", "API_KEY", &ssh_dir)
@@ -1278,7 +1420,9 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         store
             .add_certificate("default", "prod-primary", public_key_pem.as_str(), None)
             .unwrap();
-        store.set_secret("default", "API_KEY", "value").unwrap();
+        store
+            .set_secret("default", "API_KEY", "value", false)
+            .unwrap();
 
         let value = store
             .get_secret_auto("default", "API_KEY", &ssh_dir)
@@ -1301,21 +1445,23 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         store
             .add_certificate("default", "prod-primary", public_key_pem.as_str(), None)
             .unwrap();
-        store.set_secret("default", "API_KEY", "value").unwrap();
+        store
+            .set_secret("default", "API_KEY", "value", false)
+            .unwrap();
 
         let err = store
             .get_secret_auto("default", "API_KEY", &ssh_dir)
             .unwrap_err();
 
         assert!(
-            matches!(err, ValtickError::AutoPrivateKeyLookup(message) if message.contains("define --private-key"))
+            matches!(err, VaultickError::AutoPrivateKeyLookup(message) if message.contains("define --private-key"))
         );
     }
 
-    fn new_store() -> (TempDir, Valtick) {
+    fn new_store() -> (TempDir, Vaultick) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("valtick.db");
-        let store = Valtick::open(path).unwrap();
+        let path = dir.path().join("vaultick.db");
+        let store = Vaultick::open(path).unwrap();
         (dir, store)
     }
 
@@ -1324,10 +1470,10 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     ) -> Result<RsaPublicKey> {
         RsaPublicKey::new(
             BigUint::try_from(&public_key.n)
-                .map_err(|err| ValtickError::InvalidCertificate(err.to_string()))?,
+                .map_err(|err| VaultickError::InvalidCertificate(err.to_string()))?,
             BigUint::try_from(&public_key.e)
-                .map_err(|err| ValtickError::InvalidCertificate(err.to_string()))?,
+                .map_err(|err| VaultickError::InvalidCertificate(err.to_string()))?,
         )
-        .map_err(|err| ValtickError::InvalidCertificate(err.to_string()))
+        .map_err(|err| VaultickError::InvalidCertificate(err.to_string()))
     }
 }

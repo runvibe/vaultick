@@ -1,5 +1,5 @@
 [package]
-name = "valtick-bin"
+name = "vaultick"
 version = "0.1.0"
 edition = "2024"
 
@@ -8,11 +8,11 @@ clap = { version = "4.5", features = ["derive"] }
 rsa = { version = "0.9", features = ["pem"] }
 dialoguer = "0.12"
 ssh-key = { version = "0.6.7", features = ["rsa"] }
-valtick = { path = "../valtick" }
+vaultick = { package = "vaultick-lib", path = "../valtick" }
 
 [dev-dependencies]
 tempfile = "3"
 
 [[bin]]
-name = "valtick"
+name = "vaultick"
 path = "src/main.rs"

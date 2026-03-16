@@ -1380,7 +1380,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "valtick"
+name = "vaultick"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dialoguer",
+ "rsa",
+ "ssh-key",
+ "tempfile",
+ "vaultick-lib",
+]
+
+[[package]]
+name = "vaultick-lib"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -1394,18 +1406,6 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
  "x509-parser",
-]
-
-[[package]]
-name = "valtick-bin"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dialoguer",
- "rsa",
- "ssh-key",
- "tempfile",
- "valtick",
 ]
 
 [[package]]

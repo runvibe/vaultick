@@ -10,15 +10,17 @@ use dialoguer::{Select, theme::ColorfulTheme};
 use rsa::BigUint;
 use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
-use valtick::{Result as ValtickResult, RsaCertificate, SecretMetadata, Valtick, Workspace};
+use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
 const DEFAULT_DB_FILENAME: &str = "database.db";
 #[cfg(test)]
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
-const VALTICK_HOME_ENV_VAR: &str = "VALTICK_HOME";
-const WORKSPACE_ENV_VAR: &str = "VALTICK_WORKSPACE";
+const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
+const LEGACY_VALTICK_HOME_ENV_VAR: &str = "VALTICK_HOME";
+const WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
+const LEGACY_WORKSPACE_ENV_VAR: &str = "VALTICK_WORKSPACE";
 
 #[derive(Debug, Clone)]
 struct AutoRsaCandidate {
@@ -30,7 +32,7 @@ struct AutoRsaCandidate {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "valtick")]
+#[command(name = "vaultick")]
 #[command(about = "Secure secret storage backed by SQLite and RSA certificates")]
 struct Cli {
     #[arg(long, value_name = "PATH")]
@@ -90,15 +92,21 @@ struct RsaCommand {
 #[derive(Subcommand, Debug)]
 enum SecretSubcommand {
     Set {
-        key: String,
+        key: Option<String>,
         value: Option<String>,
         #[arg(long, default_value_t = false)]
         stdin: bool,
+        #[arg(long = "file", value_name = "PATH")]
+        file: Option<String>,
+        #[arg(short = 'o', long = "overwrite", default_value_t = false)]
+        overwrite: bool,
+        #[arg(long = "skip-existing", default_value_t = false)]
+        skip_existing: bool,
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_file: Option<String>,
     },
     Get {
         key: String,
-        #[arg(long = "private-key", value_name = "PEM_PATH")]
-        private_key: Option<PathBuf>,
     },
     List,
     Delete {
@@ -131,8 +139,19 @@ struct ExecCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSecretSetInput {
-    value: String,
+    value: Vec<u8>,
     print_output: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedSecretSetRequest {
+    Single {
+        key: String,
+        input: ResolvedSecretSetInput,
+    },
+    EnvFile {
+        entries: Vec<(String, String)>,
+    },
 }
 
 fn main() {
@@ -148,21 +167,21 @@ fn main() {
 fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let db_path = resolve_db_path(cli.db)?;
-    let valtick = Valtick::open(&db_path)?;
+    let vaultick = Vaultick::open(&db_path)?;
 
     match cli.command {
-        Command::Workspace(command) => handle_workspace(&valtick, command.command)?,
+        Command::Workspace(command) => handle_workspace(&vaultick, command.command)?,
         Command::Rsa(command) => {
-            let workspace_ref = resolve_workspace_ref(&valtick, cli.workspace.as_deref())?;
-            handle_rsa(&valtick, &workspace_ref, command.command)?;
+            let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
+            handle_rsa(&vaultick, &workspace_ref, command.command)?;
         }
         Command::Secret(command) => {
-            let workspace_ref = resolve_workspace_ref(&valtick, cli.workspace.as_deref())?;
-            handle_secret(&valtick, &workspace_ref, command.command)?;
+            let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
+            handle_secret(&vaultick, &workspace_ref, command.command)?;
         }
         Command::Exec(command) => {
-            let workspace_ref = resolve_workspace_ref(&valtick, cli.workspace.as_deref())?;
-            return handle_exec(&valtick, &workspace_ref, command);
+            let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
+            return handle_exec(&vaultick, &workspace_ref, command);
         }
     }
 
@@ -174,43 +193,40 @@ fn resolve_db_path(cli_db: Option<PathBuf>) -> Result<PathBuf, io::Error> {
         return Ok(path);
     }
 
-    let valtick_home = std::env::var(VALTICK_HOME_ENV_VAR)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    let vaultick_home = read_env_var(VAULTICK_HOME_ENV_VAR, Some(LEGACY_VALTICK_HOME_ENV_VAR))
         .ok_or_else(|| {
             io::Error::other(
-                "missing VALTICK_HOME. Configure something like VALTICK_HOME=\"$HOME/.valtick\" or pass --db <path>",
+                "missing VAULTICK_HOME. Configure something like VAULTICK_HOME=\"$HOME/.vaultick\" or pass --db <path>",
             )
         })?;
 
-    let home_path = PathBuf::from(valtick_home);
+    let home_path = PathBuf::from(vaultick_home);
     let db_directory = home_path.join(DEFAULT_DB_DIRECTORY);
     fs::create_dir_all(&db_directory)?;
     Ok(db_directory.join(DEFAULT_DB_FILENAME))
 }
 
 fn handle_workspace(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     command: WorkspaceSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         WorkspaceSubcommand::Create { name } => {
-            let workspace = valtick.create_workspace(&name)?;
+            let workspace = vaultick.create_workspace(&name)?;
             print_workspace(&workspace);
         }
         WorkspaceSubcommand::List => {
-            let workspaces = valtick.list_workspaces()?;
+            let workspaces = vaultick.list_workspaces()?;
             for workspace in workspaces {
                 print_workspace(&workspace);
             }
         }
         WorkspaceSubcommand::Get { workspace_ref } => {
-            let workspace = valtick.get_workspace(&workspace_ref)?;
+            let workspace = vaultick.get_workspace(&workspace_ref)?;
             print_workspace(&workspace);
         }
         WorkspaceSubcommand::Delete { workspace_ref } => {
-            valtick.delete_workspace(&workspace_ref)?;
+            vaultick.delete_workspace(&workspace_ref)?;
             println!("deleted workspace {workspace_ref}");
         }
     }
@@ -219,7 +235,7 @@ fn handle_workspace(
 }
 
 fn handle_rsa(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     command: RsaSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -232,7 +248,7 @@ fn handle_rsa(
         } => {
             let add_input = resolve_rsa_add_input(label, cert, auto)?;
             let rewrap_pem = rewrap_from_key.map(fs::read_to_string).transpose()?;
-            let certificate = valtick.add_certificate(
+            let certificate = vaultick.add_certificate(
                 workspace_ref,
                 &add_input.label,
                 &add_input.public_key_pem,
@@ -241,13 +257,13 @@ fn handle_rsa(
             print_certificate(&certificate);
         }
         RsaSubcommand::List => {
-            let certificates = valtick.list_certificates(workspace_ref)?;
+            let certificates = vaultick.list_certificates(workspace_ref)?;
             for certificate in certificates {
                 print_certificate(&certificate);
             }
         }
         RsaSubcommand::Delete { cert_ref } => {
-            valtick.delete_certificate(workspace_ref, &cert_ref)?;
+            vaultick.delete_certificate(workspace_ref, &cert_ref)?;
             println!("deleted certificate {cert_ref}");
         }
     }
@@ -256,32 +272,91 @@ fn handle_rsa(
 }
 
 fn handle_secret(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     command: SecretSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        SecretSubcommand::Set { key, value, stdin } => {
+        SecretSubcommand::Set {
+            key,
+            value,
+            stdin,
+            file,
+            overwrite,
+            skip_existing,
+            env_file,
+        } => {
             let mut stdin_reader = io::stdin().lock();
-            let input = resolve_secret_set_input(value, stdin, &mut stdin_reader)?;
-            let secret = valtick.set_secret(workspace_ref, &key, &input.value)?;
-            if input.print_output {
-                print_secret_metadata(&secret);
+            let request = resolve_secret_set_request(
+                key,
+                value,
+                stdin,
+                file.as_deref(),
+                env_file.as_deref(),
+                &mut stdin_reader,
+            )?;
+            match request {
+                ResolvedSecretSetRequest::Single { key, input } => {
+                    if skip_existing {
+                        return Err(io::Error::other(
+                            "--skip-existing can only be used with --env-file",
+                        )
+                        .into());
+                    }
+                    let secret =
+                        vaultick.set_secret_bytes(workspace_ref, &key, &input.value, overwrite)?;
+                    if input.print_output {
+                        print_secret_metadata(&secret);
+                    }
+                }
+                ResolvedSecretSetRequest::EnvFile { entries } => {
+                    if overwrite && skip_existing {
+                        return Err(io::Error::other(
+                            "--overwrite and --skip-existing cannot be used together",
+                        )
+                        .into());
+                    }
+
+                    let existing_keys = vaultick
+                        .list_secrets(workspace_ref)?
+                        .into_iter()
+                        .map(|secret| secret.key)
+                        .collect::<std::collections::HashSet<_>>();
+
+                    if !overwrite && !skip_existing {
+                        if let Some((existing_key, _)) =
+                            entries.iter().find(|(key, _)| existing_keys.contains(key))
+                        {
+                            return Err(io::Error::other(format!(
+                                "secret already exists in workspace: {existing_key}; use --overwrite to update it"
+                            ))
+                            .into());
+                        }
+                    }
+
+                    for (key, value) in entries {
+                        if skip_existing && existing_keys.contains(&key) {
+                            println!("skipped existing secret {key}");
+                            continue;
+                        }
+                        let secret = vaultick.set_secret(workspace_ref, &key, &value, overwrite)?;
+                        print_secret_metadata(&secret);
+                    }
+                }
             }
         }
-        SecretSubcommand::Get { key, private_key } => {
-            let value =
-                resolve_and_get_secret(valtick, workspace_ref, &key, private_key.as_deref())?;
-            println!("{value}");
+        SecretSubcommand::Get { key } => {
+            let secret = vaultick.get_secret_metadata(workspace_ref, &key)?;
+            print_secret_metadata(&secret);
         }
         SecretSubcommand::List => {
-            let secrets = valtick.list_secrets(workspace_ref)?;
+            let secrets = vaultick.list_secrets(workspace_ref)?;
             for secret in secrets {
                 print_secret_metadata(&secret);
             }
         }
         SecretSubcommand::Delete { key } => {
-            valtick.delete_secret(workspace_ref, &key)?;
+            vaultick.delete_secret(workspace_ref, &key)?;
             println!("deleted secret {key}");
         }
     }
@@ -298,12 +373,12 @@ struct ResolvedExecInvocation {
 }
 
 fn handle_exec(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     command: ExecCommand,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let invocation = resolve_exec_invocation(
-        valtick,
+        vaultick,
         workspace_ref,
         &command.env,
         command.all,
@@ -359,13 +434,13 @@ fn resolve_secret_set_input(
             "value and --stdin cannot be used together",
         )),
         (Some(value), false) => Ok(ResolvedSecretSetInput {
-            value,
+            value: value.into_bytes(),
             print_output: false,
         }),
         (None, false) => Err(io::Error::other("missing secret value or use --stdin")),
         (None, true) => {
-            let mut value = String::new();
-            reader.read_to_string(&mut value)?;
+            let mut value = Vec::new();
+            reader.read_to_end(&mut value)?;
             Ok(ResolvedSecretSetInput {
                 value,
                 print_output: true,
@@ -374,32 +449,149 @@ fn resolve_secret_set_input(
     }
 }
 
+fn resolve_secret_set_request(
+    key: Option<String>,
+    value: Option<String>,
+    stdin: bool,
+    file: Option<&str>,
+    env_file: Option<&str>,
+    reader: &mut impl Read,
+) -> Result<ResolvedSecretSetRequest, Box<dyn std::error::Error>> {
+    if let Some(env_file) = env_file {
+        if key.is_some() || value.is_some() || stdin || file.is_some() {
+            return Err(io::Error::other(
+                "--env-file cannot be combined with key, value, --stdin, or --file",
+            )
+            .into());
+        }
+
+        let contents = read_env_file_source(env_file, reader)?;
+        let entries = parse_env_file(&contents)?;
+        return Ok(ResolvedSecretSetRequest::EnvFile { entries });
+    }
+
+    let key = key.ok_or_else(|| io::Error::other("missing secret key or use --env-file"))?;
+    let key = normalize_secret_key(&key)?;
+    if let Some(file) = file {
+        if value.is_some() || stdin {
+            return Err(io::Error::other("--file cannot be combined with value or --stdin").into());
+        }
+
+        let value = fs::read(file)?;
+        return Ok(ResolvedSecretSetRequest::Single {
+            key,
+            input: ResolvedSecretSetInput {
+                value,
+                print_output: false,
+            },
+        });
+    }
+
+    let input = resolve_secret_set_input(value, stdin, reader)?;
+    Ok(ResolvedSecretSetRequest::Single { key, input })
+}
+
+fn read_env_file_source(path: &str, reader: &mut impl Read) -> Result<String, io::Error> {
+    if path == "-" {
+        let mut contents = String::new();
+        reader.read_to_string(&mut contents)?;
+        return Ok(contents);
+    }
+
+    fs::read_to_string(path)
+}
+
+fn parse_env_file(input: &str) -> Result<Vec<(String, String)>, io::Error> {
+    let mut entries = Vec::<(String, String)>::new();
+    let mut index_by_key = HashMap::<String, usize>::new();
+
+    for (line_number, raw_line) in input.lines().enumerate() {
+        let line_number = line_number + 1;
+        let line = raw_line.trim();
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let (raw_key, raw_value) = line.split_once('=').ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid env file entry at line {line_number}: expected KEY=VALUE"
+            ))
+        })?;
+
+        let key = normalize_secret_key(raw_key.trim())?;
+        if key.is_empty() {
+            return Err(io::Error::other(format!(
+                "invalid env file entry at line {line_number}: missing key"
+            )));
+        }
+
+        if !is_valid_env_var_name(&key) {
+            return Err(io::Error::other(format!(
+                "invalid env file entry at line {line_number}: invalid key {key}"
+            )));
+        }
+
+        let value = parse_env_value(raw_value.trim());
+        if let Some(index) = index_by_key.get(&key).copied() {
+            entries[index].1 = value;
+        } else {
+            index_by_key.insert(key.clone(), entries.len());
+            entries.push((key, value));
+        }
+    }
+
+    Ok(entries)
+}
+
+fn parse_env_value(value: &str) -> String {
+    if value.len() >= 2 {
+        let first = value.as_bytes()[0];
+        let last = value.as_bytes()[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+
+    value.to_string()
+}
+
+fn normalize_secret_key(key: &str) -> Result<String, io::Error> {
+    let normalized = key.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Err(io::Error::other("secret key cannot be empty"));
+    }
+
+    Ok(normalized)
+}
+
 fn resolve_and_get_secret(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     key: &str,
     private_key: Option<&Path>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(private_key_path) = private_key {
         let private_key_pem = fs::read_to_string(private_key_path)?;
-        return Ok(valtick.get_secret(workspace_ref, key, &private_key_pem)?);
+        return Ok(vaultick.get_secret(workspace_ref, key, &private_key_pem)?);
     }
 
     let ssh_dir = resolve_ssh_dir().map_err(|_| {
         io::Error::other("no private key candidate was found automatically; define --private-key")
     })?;
-    Ok(valtick.get_secret_auto(workspace_ref, key, &ssh_dir)?)
+    Ok(vaultick.get_secret_auto(workspace_ref, key, &ssh_dir)?)
 }
 
 fn resolve_exec_invocation(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     env_names: &[String],
     all: bool,
     argv: &[String],
     private_key: Option<&Path>,
 ) -> Result<ResolvedExecInvocation, Box<dyn std::error::Error>> {
-    let mut resolver = ExecTemplateResolver::new(valtick, workspace_ref, private_key)?;
+    let mut resolver = ExecTemplateResolver::new(vaultick, workspace_ref, private_key)?;
     let mut env_vars = resolve_exec_env_vars(&mut resolver, env_names, all)?;
     let mut command_start = 0;
 
@@ -441,12 +633,12 @@ fn resolve_exec_invocation(
 
 #[cfg(test)]
 fn resolve_exec_template(
-    valtick: &Valtick,
+    vaultick: &Vaultick,
     workspace_ref: &str,
     input: &str,
     private_key: Option<&Path>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut resolver = ExecTemplateResolver::new(valtick, workspace_ref, private_key)?;
+    let mut resolver = ExecTemplateResolver::new(vaultick, workspace_ref, private_key)?;
     resolver.resolve_template(input)
 }
 
@@ -464,15 +656,16 @@ fn resolve_exec_env_vars(
         }
     } else {
         for env_name in env_names {
-            if !is_valid_env_var_name(env_name) {
+            let normalized_env_name = normalize_secret_key(env_name)?;
+            if !is_valid_env_var_name(&normalized_env_name) {
                 return Err(io::Error::other(format!(
                     "invalid environment variable name: {env_name}"
                 ))
                 .into());
             }
 
-            let value = resolver.resolve_template(&format!("${env_name}"))?;
-            upsert_env_var(&mut env_vars, env_name.clone(), value);
+            let value = resolver.resolve_template(&format!("${normalized_env_name}"))?;
+            upsert_env_var(&mut env_vars, normalized_env_name, value);
         }
     }
 
@@ -488,7 +681,7 @@ fn upsert_env_var(env_vars: &mut Vec<(String, String)>, name: String, value: Str
 }
 
 struct ExecTemplateResolver<'a> {
-    valtick: &'a Valtick,
+    vaultick: &'a Vaultick,
     workspace_ref: &'a str,
     private_key: Option<&'a Path>,
     secret_key_index: HashMap<String, String>,
@@ -498,13 +691,13 @@ struct ExecTemplateResolver<'a> {
 
 impl<'a> ExecTemplateResolver<'a> {
     fn new(
-        valtick: &'a Valtick,
+        vaultick: &'a Vaultick,
         workspace_ref: &'a str,
         private_key: Option<&'a Path>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut secret_key_index = HashMap::new();
 
-        for secret in valtick.list_secrets(workspace_ref)? {
+        for secret in vaultick.list_secrets(workspace_ref)? {
             let normalized_key = secret.key.to_ascii_lowercase();
             if let Some(existing_key) = secret_key_index.insert(normalized_key, secret.key.clone())
             {
@@ -517,7 +710,7 @@ impl<'a> ExecTemplateResolver<'a> {
         }
 
         Ok(Self {
-            valtick,
+            vaultick,
             workspace_ref,
             private_key,
             secret_key_index,
@@ -560,7 +753,7 @@ impl<'a> ExecTemplateResolver<'a> {
         }
 
         let value = resolve_and_get_secret(
-            self.valtick,
+            self.vaultick,
             self.workspace_ref,
             secret_key,
             self.private_key,
@@ -978,20 +1171,28 @@ fn print_secret_metadata(secret: &SecretMetadata) {
     );
 }
 
-fn resolve_workspace_ref(valtick: &Valtick, cli_workspace: Option<&str>) -> ValtickResult<String> {
+fn resolve_workspace_ref(
+    vaultick: &Vaultick,
+    cli_workspace: Option<&str>,
+) -> VaultickResult<String> {
     if let Some(workspace) = cli_workspace {
         return Ok(workspace.to_string());
     }
 
-    if let Ok(workspace) = std::env::var(WORKSPACE_ENV_VAR) {
-        let trimmed = workspace.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
+    if let Some(workspace) = read_env_var(WORKSPACE_ENV_VAR, Some(LEGACY_WORKSPACE_ENV_VAR)) {
+        return Ok(workspace);
     }
 
-    let workspace = valtick.get_workspace(DEFAULT_WORKSPACE_NAME)?;
+    let workspace = vaultick.get_workspace(DEFAULT_WORKSPACE_NAME)?;
     Ok(workspace.name)
+}
+
+fn read_env_var(primary: &str, legacy: Option<&str>) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| legacy.and_then(|name| std::env::var(name).ok()))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -1046,7 +1247,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     #[test]
     fn explicit_workspace_takes_priority() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         store.create_workspace("team-a").unwrap();
         unsafe { std::env::set_var(WORKSPACE_ENV_VAR, "team-b") };
 
@@ -1059,7 +1260,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     #[test]
     fn env_workspace_is_used_when_flag_is_missing() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         store.create_workspace("team-a").unwrap();
         unsafe { std::env::set_var(WORKSPACE_ENV_VAR, "team-a") };
 
@@ -1072,7 +1273,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     #[test]
     fn default_workspace_is_used_when_no_flag_or_env_exist() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
 
         let resolved = resolve_workspace_ref(&store, None).unwrap();
@@ -1083,7 +1284,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     #[test]
     fn missing_default_workspace_returns_error() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
         store.delete_workspace(DEFAULT_WORKSPACE_NAME).unwrap();
 
@@ -1091,7 +1292,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
         assert!(matches!(
             err,
-            valtick::ValtickError::NotFound {
+            vaultick::VaultickError::NotFound {
                 entity: "workspace",
                 reference
             } if reference == DEFAULT_WORKSPACE_NAME
@@ -1102,19 +1303,19 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     fn explicit_db_path_takes_priority() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let explicit = PathBuf::from("/tmp/explicit.db");
-        unsafe { std::env::set_var(VALTICK_HOME_ENV_VAR, "/tmp/valtick-home") };
+        unsafe { std::env::set_var(VAULTICK_HOME_ENV_VAR, "/tmp/vaultick-home") };
 
         let resolved = resolve_db_path(Some(explicit.clone())).unwrap();
 
         assert_eq!(resolved, explicit);
-        unsafe { std::env::remove_var(VALTICK_HOME_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_HOME_ENV_VAR) };
     }
 
     #[test]
-    fn valtick_home_is_used_when_db_flag_is_missing() {
+    fn vaultick_home_is_used_when_db_flag_is_missing() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let dir = tempdir().unwrap();
-        unsafe { std::env::set_var(VALTICK_HOME_ENV_VAR, dir.path()) };
+        unsafe { std::env::set_var(VAULTICK_HOME_ENV_VAR, dir.path()) };
 
         let resolved = resolve_db_path(None).unwrap();
 
@@ -1125,17 +1326,20 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
                 .join(DEFAULT_DB_FILENAME)
         );
         assert!(dir.path().join(DEFAULT_DB_DIRECTORY).exists());
-        unsafe { std::env::remove_var(VALTICK_HOME_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_HOME_ENV_VAR) };
     }
 
     #[test]
-    fn missing_valtick_home_returns_guidance() {
+    fn missing_vaultick_home_returns_guidance() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
-        unsafe { std::env::remove_var(VALTICK_HOME_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_HOME_ENV_VAR) };
 
         let err = resolve_db_path(None).unwrap_err();
 
-        assert!(err.to_string().contains("VALTICK_HOME=\"$HOME/.valtick\""));
+        assert!(
+            err.to_string()
+                .contains("VAULTICK_HOME=\"$HOME/.vaultick\"")
+        );
     }
 
     #[test]
@@ -1173,7 +1377,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         fs::write(ssh_dir.join("id_rsa"), SSH_RSA_PRIVATE).unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1188,7 +1392,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "API_KEY", "value-from-auto-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "API_KEY",
+                "value-from-auto-key",
+                false,
+            )
             .unwrap();
 
         let value =
@@ -1207,7 +1416,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         fs::create_dir_all(&ssh_dir).unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1222,7 +1431,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "API_KEY", "value-from-auto-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "API_KEY",
+                "value-from-auto-key",
+                false,
+            )
             .unwrap();
 
         let err =
@@ -1244,7 +1458,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         fs::write(ssh_dir.join(DEFAULT_SSH_PRIVATE_KEY_NAME), SSH_RSA_PRIVATE).unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1259,7 +1473,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "API_KEY", "value-from-id-rsa")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "API_KEY",
+                "value-from-id-rsa",
+                false,
+            )
             .unwrap();
 
         let value =
@@ -1283,7 +1502,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         .unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1298,7 +1517,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "API_KEY", "value-from-id-rsa")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "API_KEY",
+                "value-from-id-rsa",
+                false,
+            )
             .unwrap();
 
         let err =
@@ -1319,7 +1543,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         fs::write(ssh_dir.join("primary"), "not-a-valid-private-key").unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1333,7 +1557,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "API_KEY", "value-from-auto-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "API_KEY",
+                "value-from-auto-key",
+                false,
+            )
             .unwrap();
 
         let err =
@@ -1347,7 +1576,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_template_uses_explicit_private_key() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1362,10 +1591,10 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice", false)
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret", false)
             .unwrap();
 
         let temp = tempdir().unwrap();
@@ -1393,7 +1622,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         fs::write(ssh_dir.join(DEFAULT_SSH_PRIVATE_KEY_NAME), SSH_RSA_PRIVATE).unwrap();
         unsafe { std::env::set_var("HOME", home.path()) };
 
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1408,10 +1637,10 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice", false)
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret", false)
             .unwrap();
 
         let rendered = resolve_exec_template(
@@ -1436,10 +1665,170 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(
             resolved,
             ResolvedSecretSetInput {
-                value: "token-value".to_string(),
+                value: b"token-value".to_vec(),
                 print_output: false,
             }
         );
+    }
+
+    #[test]
+    fn secret_set_env_file_parses_entries_without_revealing_values() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let request = resolve_secret_set_request(
+            None,
+            None,
+            false,
+            None,
+            Some("-"),
+            &mut std::io::Cursor::new(
+                b"github_token=ghp_123\nexport aws_access_key_id=\"AKIA123\"\n".to_vec(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            ResolvedSecretSetRequest::EnvFile {
+                entries: vec![
+                    ("GITHUB_TOKEN".to_string(), "ghp_123".to_string()),
+                    ("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string()),
+                ]
+            }
+        );
+
+        let err = resolve_secret_set_request(
+            Some("TOKEN".to_string()),
+            None,
+            false,
+            None,
+            Some(".env"),
+            &mut reader,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--env-file cannot be combined"));
+    }
+
+    #[test]
+    fn secret_set_command_parses_skip_existing_flag() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "secret",
+            "set",
+            "--env-file",
+            ".env",
+            "--skip-existing",
+        ])
+        .unwrap();
+
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+
+        let SecretSubcommand::Set {
+            env_file,
+            skip_existing,
+            overwrite,
+            ..
+        } = command.command
+        else {
+            panic!("expected secret set command");
+        };
+
+        assert_eq!(env_file, Some(".env".to_string()));
+        assert!(skip_existing);
+        assert!(!overwrite);
+    }
+
+    #[test]
+    fn secret_set_request_normalizes_single_key_to_uppercase() {
+        let request = resolve_secret_set_request(
+            Some("google_token".to_string()),
+            Some("token-value".to_string()),
+            false,
+            None,
+            None,
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            ResolvedSecretSetRequest::Single {
+                key: "GOOGLE_TOKEN".to_string(),
+                input: ResolvedSecretSetInput {
+                    value: b"token-value".to_vec(),
+                    print_output: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn secret_set_file_reads_binary_without_printing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        fs::write(&path, [0x00, 0x7f, 0xff, 0x41]).unwrap();
+
+        let request = resolve_secret_set_request(
+            Some("TOKEN".to_string()),
+            None,
+            false,
+            Some(path.to_str().unwrap()),
+            None,
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            ResolvedSecretSetRequest::Single {
+                key: "TOKEN".to_string(),
+                input: ResolvedSecretSetInput {
+                    value: vec![0x00, 0x7f, 0xff, 0x41],
+                    print_output: false,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn secret_set_file_rejects_conflicting_inputs() {
+        let err = resolve_secret_set_request(
+            Some("TOKEN".to_string()),
+            Some("value".to_string()),
+            false,
+            Some("secret.txt"),
+            None,
+            &mut std::io::Cursor::new(Vec::<u8>::new()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--file cannot be combined"));
+    }
+
+    #[test]
+    fn parse_env_file_supports_comments_and_last_value_wins() {
+        let entries = parse_env_file(
+            "\n# comment\ngithub_token=one\nexport GITHUB_TOKEN=two\naws_region='us-east-1'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("GITHUB_TOKEN".to_string(), "two".to_string()),
+                ("AWS_REGION".to_string(), "us-east-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_file_rejects_invalid_lines() {
+        let err = parse_env_file("not-valid").unwrap_err();
+
+        assert!(err.to_string().contains("expected KEY=VALUE"));
     }
 
     #[test]
@@ -1451,7 +1840,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(
             resolved,
             ResolvedSecretSetInput {
-                value: "token-from-stdin".to_string(),
+                value: b"token-from-stdin".to_vec(),
                 print_output: true,
             }
         );
@@ -1478,7 +1867,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_command_parses_arguments_after_double_dash() {
-        let cli = Cli::try_parse_from(["valtick", "exec", "--", "AWS_KEY=$AWS_KEY", "aws", "stg"])
+        let cli = Cli::try_parse_from(["vaultick", "exec", "--", "AWS_KEY=$AWS_KEY", "aws", "stg"])
             .unwrap();
 
         let Command::Exec(command) = cli.command else {
@@ -1493,7 +1882,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     #[test]
     fn exec_command_parses_env_flags_and_all_flag() {
         let cli = Cli::try_parse_from([
-            "valtick",
+            "vaultick",
             "exec",
             "--env",
             "GITHUB_TOKEN",
@@ -1515,7 +1904,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(command.argv, vec!["aws", "sts", "get-caller-identity"]);
 
         let cli = Cli::try_parse_from([
-            "valtick",
+            "vaultick",
             "exec",
             "--all",
             "--",
@@ -1536,7 +1925,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_invocation_resolves_env_assignments_and_preserves_args() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1551,10 +1940,15 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_KEY",
+                "secret-access-key",
+                false,
+            )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_PROFILE", "prod")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_PROFILE", "prod", false)
             .unwrap();
 
         let temp = tempdir().unwrap();
@@ -1591,7 +1985,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_invocation_loads_named_envs_from_workspace() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1606,10 +2000,15 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123", false)
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_ACCESS_KEY_ID", "AKIA123")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_ACCESS_KEY_ID",
+                "AKIA123",
+                false,
+            )
             .unwrap();
 
         let temp = tempdir().unwrap();
@@ -1619,7 +2018,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let invocation = resolve_exec_invocation(
             &store,
             DEFAULT_WORKSPACE_NAME,
-            &["GITHUB_TOKEN".to_string(), "AWS_ACCESS_KEY_ID".to_string()],
+            &["github_token".to_string(), "aws_access_key_id".to_string()],
             false,
             &[
                 "aws".to_string(),
@@ -1647,7 +2046,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_invocation_loads_all_workspace_secrets() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1662,13 +2061,19 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_ACCESS_KEY_ID", "AKIA123")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_ACCESS_KEY_ID",
+                "AKIA123",
+                false,
+            )
             .unwrap();
         store
             .set_secret(
                 DEFAULT_WORKSPACE_NAME,
                 "AWS_SECRET_ACCESS_KEY",
                 "secret-key",
+                false,
             )
             .unwrap();
 
@@ -1708,7 +2113,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_invocation_uses_env_name_when_assignment_value_is_empty() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1723,7 +2128,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_KEY",
+                "secret-access-key",
+                false,
+            )
             .unwrap();
 
         let temp = tempdir().unwrap();
@@ -1752,7 +2162,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_assignment_overrides_env_flag_value() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1767,10 +2177,15 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_KEY",
+                "secret-access-key",
+                false,
+            )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "OVERRIDE", "override-value")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "OVERRIDE", "override-value", false)
             .unwrap();
 
         let temp = tempdir().unwrap();
@@ -1802,7 +2217,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
     #[test]
     fn exec_invocation_leaves_shell_variables_in_arguments_untouched() {
-        let store = Valtick::open(":memory:").unwrap();
+        let store = Vaultick::open(":memory:").unwrap();
         let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
         let rsa_public =
             ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
@@ -1817,7 +2232,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             )
             .unwrap();
         store
-            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123")
+            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123", false)
             .unwrap();
 
         let temp = tempdir().unwrap();

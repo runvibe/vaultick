@@ -1,5 +1,5 @@
 [package]
-name = "valtick"
+name = "vaultick-lib"
 version = "0.1.0"
 edition = "2024"
 

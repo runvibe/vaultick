@@ -18,9 +18,7 @@ const DEFAULT_DB_FILENAME: &str = "database.db";
 #[cfg(test)]
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
 const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
-const LEGACY_VALTICK_HOME_ENV_VAR: &str = "VALTICK_HOME";
-const WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
-const LEGACY_WORKSPACE_ENV_VAR: &str = "VALTICK_WORKSPACE";
+const VAULTICK_WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
 
 #[derive(Debug, Clone)]
 struct AutoRsaCandidate {
@@ -193,12 +191,11 @@ fn resolve_db_path(cli_db: Option<PathBuf>) -> Result<PathBuf, io::Error> {
         return Ok(path);
     }
 
-    let vaultick_home = read_env_var(VAULTICK_HOME_ENV_VAR, Some(LEGACY_VALTICK_HOME_ENV_VAR))
-        .ok_or_else(|| {
-            io::Error::other(
-                "missing VAULTICK_HOME. Configure something like VAULTICK_HOME=\"$HOME/.vaultick\" or pass --db <path>",
-            )
-        })?;
+    let vaultick_home = read_env_var(VAULTICK_HOME_ENV_VAR).ok_or_else(|| {
+        io::Error::other(
+            "missing VAULTICK_HOME. Configure something like VAULTICK_HOME=\"$HOME/.vaultick\" or pass --db <path>",
+        )
+    })?;
 
     let home_path = PathBuf::from(vaultick_home);
     let db_directory = home_path.join(DEFAULT_DB_DIRECTORY);
@@ -1179,7 +1176,7 @@ fn resolve_workspace_ref(
         return Ok(workspace.to_string());
     }
 
-    if let Some(workspace) = read_env_var(WORKSPACE_ENV_VAR, Some(LEGACY_WORKSPACE_ENV_VAR)) {
+    if let Some(workspace) = read_env_var(VAULTICK_WORKSPACE_ENV_VAR) {
         return Ok(workspace);
     }
 
@@ -1187,10 +1184,9 @@ fn resolve_workspace_ref(
     Ok(workspace.name)
 }
 
-fn read_env_var(primary: &str, legacy: Option<&str>) -> Option<String> {
-    std::env::var(primary)
+fn read_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .or_else(|| legacy.and_then(|name| std::env::var(name).ok()))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -1249,12 +1245,12 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let store = Vaultick::open(":memory:").unwrap();
         store.create_workspace("team-a").unwrap();
-        unsafe { std::env::set_var(WORKSPACE_ENV_VAR, "team-b") };
+        unsafe { std::env::set_var(VAULTICK_WORKSPACE_ENV_VAR, "team-b") };
 
         let resolved = resolve_workspace_ref(&store, Some("team-a")).unwrap();
 
         assert_eq!(resolved, "team-a");
-        unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_WORKSPACE_ENV_VAR) };
     }
 
     #[test]
@@ -1262,19 +1258,19 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let store = Vaultick::open(":memory:").unwrap();
         store.create_workspace("team-a").unwrap();
-        unsafe { std::env::set_var(WORKSPACE_ENV_VAR, "team-a") };
+        unsafe { std::env::set_var(VAULTICK_WORKSPACE_ENV_VAR, "team-a") };
 
         let resolved = resolve_workspace_ref(&store, None).unwrap();
 
         assert_eq!(resolved, "team-a");
-        unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_WORKSPACE_ENV_VAR) };
     }
 
     #[test]
     fn default_workspace_is_used_when_no_flag_or_env_exist() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let store = Vaultick::open(":memory:").unwrap();
-        unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_WORKSPACE_ENV_VAR) };
 
         let resolved = resolve_workspace_ref(&store, None).unwrap();
 
@@ -1285,7 +1281,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     fn missing_default_workspace_returns_error() {
         let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let store = Vaultick::open(":memory:").unwrap();
-        unsafe { std::env::remove_var(WORKSPACE_ENV_VAR) };
+        unsafe { std::env::remove_var(VAULTICK_WORKSPACE_ENV_VAR) };
         store.delete_workspace(DEFAULT_WORKSPACE_NAME).unwrap();
 
         let err = resolve_workspace_ref(&store, None).unwrap_err();

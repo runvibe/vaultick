@@ -65,9 +65,6 @@ Workspace resolution order:
 
 When a new database is created, `vaultick` also creates a `default` workspace.
 
-Legacy env vars `VALTICK_HOME` and `VALTICK_WORKSPACE` are still accepted as
-fallbacks.
-
 ## Quick start
 
 Generate an RSA keypair if you do not already have one:

@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
 
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Select, theme::ColorfulTheme};
@@ -12,6 +15,7 @@ use valtick::{Result as ValtickResult, RsaCertificate, SecretMetadata, Valtick, 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
 const DEFAULT_DB_FILENAME: &str = "database.db";
+#[cfg(test)]
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
 const VALTICK_HOME_ENV_VAR: &str = "VALTICK_HOME";
 const WORKSPACE_ENV_VAR: &str = "VALTICK_WORKSPACE";
@@ -42,6 +46,7 @@ enum Command {
     Workspace(WorkspaceCommand),
     Rsa(RsaCommand),
     Secret(SecretCommand),
+    Exec(ExecCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -86,7 +91,9 @@ struct RsaCommand {
 enum SecretSubcommand {
     Set {
         key: String,
-        value: String,
+        value: Option<String>,
+        #[arg(long, default_value_t = false)]
+        stdin: bool,
     },
     Get {
         key: String,
@@ -105,14 +112,40 @@ struct SecretCommand {
     command: SecretSubcommand,
 }
 
+#[derive(Args, Debug)]
+struct ExecCommand {
+    #[arg(long = "private-key", value_name = "PEM_PATH")]
+    private_key: Option<PathBuf>,
+    #[arg(long = "env", value_name = "KEY", conflicts_with = "all")]
+    env: Vec<String>,
+    #[arg(long = "all", default_value_t = false, conflicts_with = "env")]
+    all: bool,
+    #[arg(
+        required = true,
+        num_args = 1..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedSecretSetInput {
+    value: String,
+    print_output: bool,
+}
+
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let db_path = resolve_db_path(cli.db)?;
     let valtick = Valtick::open(&db_path)?;
@@ -127,9 +160,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let workspace_ref = resolve_workspace_ref(&valtick, cli.workspace.as_deref())?;
             handle_secret(&valtick, &workspace_ref, command.command)?;
         }
+        Command::Exec(command) => {
+            let workspace_ref = resolve_workspace_ref(&valtick, cli.workspace.as_deref())?;
+            return handle_exec(&valtick, &workspace_ref, command);
+        }
     }
 
-    Ok(())
+    Ok(0)
 }
 
 fn resolve_db_path(cli_db: Option<PathBuf>) -> Result<PathBuf, io::Error> {
@@ -224,9 +261,13 @@ fn handle_secret(
     command: SecretSubcommand,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        SecretSubcommand::Set { key, value } => {
-            let secret = valtick.set_secret(workspace_ref, &key, &value)?;
-            print_secret_metadata(&secret);
+        SecretSubcommand::Set { key, value, stdin } => {
+            let mut stdin_reader = io::stdin().lock();
+            let input = resolve_secret_set_input(value, stdin, &mut stdin_reader)?;
+            let secret = valtick.set_secret(workspace_ref, &key, &input.value)?;
+            if input.print_output {
+                print_secret_metadata(&secret);
+            }
         }
         SecretSubcommand::Get { key, private_key } => {
             let value =
@@ -248,6 +289,91 @@ fn handle_secret(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedExecInvocation {
+    program: String,
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    redacted_values: Vec<String>,
+}
+
+fn handle_exec(
+    valtick: &Valtick,
+    workspace_ref: &str,
+    command: ExecCommand,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let invocation = resolve_exec_invocation(
+        valtick,
+        workspace_ref,
+        &command.env,
+        command.all,
+        &command.argv,
+        command.private_key.as_deref(),
+    )?;
+
+    let mut child = ProcessCommand::new(&invocation.program);
+    child.args(&invocation.args);
+    child.envs(invocation.env_vars.iter().map(|(key, value)| (key, value)));
+    child.stdout(Stdio::piped());
+    child.stderr(Stdio::piped());
+
+    let mut child = child.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("failed to capture child stderr"))?;
+
+    let stdout_redactions = invocation.redacted_values.clone();
+    let stderr_redactions = invocation.redacted_values.clone();
+
+    let stdout_handle = thread::spawn(move || -> io::Result<()> {
+        let mut writer = io::stdout().lock();
+        stream_redacted_output(stdout, &mut writer, &stdout_redactions)
+    });
+    let stderr_handle = thread::spawn(move || -> io::Result<()> {
+        let mut writer = io::stderr().lock();
+        stream_redacted_output(stderr, &mut writer, &stderr_redactions)
+    });
+
+    let status = child.wait()?;
+    stdout_handle
+        .join()
+        .map_err(|_| io::Error::other("failed to join child stdout reader"))??;
+    stderr_handle
+        .join()
+        .map_err(|_| io::Error::other("failed to join child stderr reader"))??;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn resolve_secret_set_input(
+    value: Option<String>,
+    stdin: bool,
+    reader: &mut impl Read,
+) -> Result<ResolvedSecretSetInput, io::Error> {
+    match (value, stdin) {
+        (Some(_), true) => Err(io::Error::other(
+            "value and --stdin cannot be used together",
+        )),
+        (Some(value), false) => Ok(ResolvedSecretSetInput {
+            value,
+            print_output: false,
+        }),
+        (None, false) => Err(io::Error::other("missing secret value or use --stdin")),
+        (None, true) => {
+            let mut value = String::new();
+            reader.read_to_string(&mut value)?;
+            Ok(ResolvedSecretSetInput {
+                value,
+                print_output: true,
+            })
+        }
+    }
+}
+
 fn resolve_and_get_secret(
     valtick: &Valtick,
     workspace_ref: &str,
@@ -263,6 +389,368 @@ fn resolve_and_get_secret(
         io::Error::other("no private key candidate was found automatically; define --private-key")
     })?;
     Ok(valtick.get_secret_auto(workspace_ref, key, &ssh_dir)?)
+}
+
+fn resolve_exec_invocation(
+    valtick: &Valtick,
+    workspace_ref: &str,
+    env_names: &[String],
+    all: bool,
+    argv: &[String],
+    private_key: Option<&Path>,
+) -> Result<ResolvedExecInvocation, Box<dyn std::error::Error>> {
+    let mut resolver = ExecTemplateResolver::new(valtick, workspace_ref, private_key)?;
+    let mut env_vars = resolve_exec_env_vars(&mut resolver, env_names, all)?;
+    let mut command_start = 0;
+
+    while let Some(token) = argv.get(command_start) {
+        let Some((name, raw_value)) = token.split_once('=') else {
+            break;
+        };
+
+        if !is_valid_env_var_name(name) {
+            break;
+        }
+
+        let template = if raw_value.is_empty() {
+            format!("${name}")
+        } else {
+            raw_value.to_string()
+        };
+        let value = resolver.resolve_template(&template)?;
+        upsert_env_var(&mut env_vars, name.to_string(), value);
+        command_start += 1;
+    }
+
+    let Some(program_token) = argv.get(command_start) else {
+        return Err(
+            io::Error::other("missing command to execute after environment assignments").into(),
+        );
+    };
+
+    let program = program_token.clone();
+    let args = argv[command_start + 1..].to_vec();
+
+    Ok(ResolvedExecInvocation {
+        program,
+        args,
+        env_vars,
+        redacted_values: resolver.into_redacted_values(),
+    })
+}
+
+#[cfg(test)]
+fn resolve_exec_template(
+    valtick: &Valtick,
+    workspace_ref: &str,
+    input: &str,
+    private_key: Option<&Path>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut resolver = ExecTemplateResolver::new(valtick, workspace_ref, private_key)?;
+    resolver.resolve_template(input)
+}
+
+fn resolve_exec_env_vars(
+    resolver: &mut ExecTemplateResolver<'_>,
+    env_names: &[String],
+    all: bool,
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut env_vars = Vec::new();
+
+    if all {
+        for secret_key in resolver.list_secret_keys() {
+            let value = resolver.resolve_secret_value(&secret_key)?;
+            upsert_env_var(&mut env_vars, secret_key, value);
+        }
+    } else {
+        for env_name in env_names {
+            if !is_valid_env_var_name(env_name) {
+                return Err(io::Error::other(format!(
+                    "invalid environment variable name: {env_name}"
+                ))
+                .into());
+            }
+
+            let value = resolver.resolve_template(&format!("${env_name}"))?;
+            upsert_env_var(&mut env_vars, env_name.clone(), value);
+        }
+    }
+
+    Ok(env_vars)
+}
+
+fn upsert_env_var(env_vars: &mut Vec<(String, String)>, name: String, value: String) {
+    if let Some((_, existing_value)) = env_vars.iter_mut().find(|(key, _)| *key == name) {
+        *existing_value = value;
+    } else {
+        env_vars.push((name, value));
+    }
+}
+
+struct ExecTemplateResolver<'a> {
+    valtick: &'a Valtick,
+    workspace_ref: &'a str,
+    private_key: Option<&'a Path>,
+    secret_key_index: HashMap<String, String>,
+    secret_cache: HashMap<String, String>,
+    redacted_values: Vec<String>,
+}
+
+impl<'a> ExecTemplateResolver<'a> {
+    fn new(
+        valtick: &'a Valtick,
+        workspace_ref: &'a str,
+        private_key: Option<&'a Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut secret_key_index = HashMap::new();
+
+        for secret in valtick.list_secrets(workspace_ref)? {
+            let normalized_key = secret.key.to_ascii_lowercase();
+            if let Some(existing_key) = secret_key_index.insert(normalized_key, secret.key.clone())
+            {
+                return Err(io::Error::other(format!(
+                    "cannot use exec placeholder resolution because secrets {existing_key} and {} collide",
+                    secret.key
+                ))
+                .into());
+            }
+        }
+
+        Ok(Self {
+            valtick,
+            workspace_ref,
+            private_key,
+            secret_key_index,
+            secret_cache: HashMap::new(),
+            redacted_values: Vec::new(),
+        })
+    }
+
+    fn list_secret_keys(&self) -> Vec<String> {
+        let mut keys = self.secret_key_index.values().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    fn resolve_template(&mut self, input: &str) -> Result<String, Box<dyn std::error::Error>> {
+        replace_exec_placeholders(input, |secret_key| {
+            self.resolve_secret_value_by_placeholder(secret_key)
+        })
+    }
+
+    fn resolve_secret_value_by_placeholder(
+        &mut self,
+        secret_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let resolved_key = self
+            .secret_key_index
+            .get(&secret_key.to_ascii_lowercase())
+            .cloned()
+            .ok_or_else(|| io::Error::other(format!("secret not found: {secret_key}")))?;
+
+        self.resolve_secret_value(&resolved_key)
+    }
+
+    fn resolve_secret_value(
+        &mut self,
+        secret_key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(value) = self.secret_cache.get(secret_key) {
+            return Ok(value.clone());
+        }
+
+        let value = resolve_and_get_secret(
+            self.valtick,
+            self.workspace_ref,
+            secret_key,
+            self.private_key,
+        )?;
+        if !value.is_empty() && !self.redacted_values.iter().any(|item| item == &value) {
+            self.redacted_values.push(value.clone());
+        }
+        self.secret_cache
+            .insert(secret_key.to_string(), value.clone());
+        Ok(value)
+    }
+
+    fn into_redacted_values(self) -> Vec<String> {
+        self.redacted_values
+    }
+}
+
+fn replace_exec_placeholders<F>(
+    input: &str,
+    mut resolve_secret: F,
+) -> Result<String, Box<dyn std::error::Error>>
+where
+    F: FnMut(&str) -> Result<String, Box<dyn std::error::Error>>,
+{
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while let Some(start_offset) = input[cursor..].find('$') {
+        let start = cursor + start_offset;
+        output.push_str(&input[cursor..start]);
+
+        let Some(first_char) = input[start + 1..].chars().next() else {
+            output.push('$');
+            cursor = start + 1;
+            break;
+        };
+
+        if !is_exec_placeholder_start(first_char) {
+            output.push('$');
+            cursor = start + 1;
+            continue;
+        }
+
+        let mut end = start + 1 + first_char.len_utf8();
+        for ch in input[end..].chars() {
+            if is_exec_placeholder_continue(ch) {
+                end += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        let secret_key = &input[start + 1..end];
+        output.push_str(&resolve_secret(secret_key)?);
+        cursor = end;
+    }
+
+    output.push_str(&input[cursor..]);
+    Ok(output)
+}
+
+fn stream_redacted_output(
+    mut reader: impl Read,
+    writer: &mut impl Write,
+    redacted_values: &[String],
+) -> io::Result<()> {
+    let patterns = build_redaction_patterns(redacted_values);
+    let mut pending = Vec::new();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        for byte in &buffer[..bytes_read] {
+            pending.push(*byte);
+            flush_redaction_pending(writer, &mut pending, &patterns, false)?;
+        }
+        writer.flush()?;
+    }
+
+    flush_redaction_pending(writer, &mut pending, &patterns, true)?;
+    writer.flush()
+}
+
+fn build_redaction_patterns(redacted_values: &[String]) -> Vec<Vec<u8>> {
+    let mut patterns = redacted_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    patterns.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    patterns.dedup();
+    patterns
+}
+
+#[cfg(test)]
+fn redact_bytes(bytes: &[u8], patterns: &[Vec<u8>]) -> Vec<u8> {
+    if patterns.is_empty() {
+        return bytes.to_vec();
+    }
+
+    let mut redacted = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if let Some(pattern) = patterns.iter().find(|pattern| {
+            let len = pattern.len();
+            len > 0 && index + len <= bytes.len() && bytes[index..index + len] == pattern[..]
+        }) {
+            redacted.extend_from_slice(b"[REDACTED]");
+            index += pattern.len();
+        } else {
+            redacted.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    redacted
+}
+
+fn flush_redaction_pending(
+    writer: &mut impl Write,
+    pending: &mut Vec<u8>,
+    patterns: &[Vec<u8>],
+    eof: bool,
+) -> io::Result<()> {
+    loop {
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(pattern) = patterns
+            .iter()
+            .find(|pattern| pending.starts_with(pattern.as_slice()))
+        {
+            let waiting_for_longer_match = !eof
+                && patterns.iter().any(|candidate| {
+                    candidate.len() > pending.len() && candidate.starts_with(pending.as_slice())
+                });
+
+            if waiting_for_longer_match {
+                return Ok(());
+            }
+
+            writer.write_all(b"[REDACTED]")?;
+            pending.drain(..pattern.len());
+            continue;
+        }
+
+        let waiting_for_partial_match = !eof
+            && patterns
+                .iter()
+                .any(|pattern| pattern.starts_with(pending.as_slice()));
+        if waiting_for_partial_match {
+            return Ok(());
+        }
+
+        writer.write_all(&pending[..1])?;
+        pending.drain(..1);
+    }
+}
+
+#[cfg(test)]
+fn redact_output(output: &str, redacted_values: &[String]) -> String {
+    String::from_utf8_lossy(&redact_bytes(
+        output.as_bytes(),
+        &build_redaction_patterns(redacted_values),
+    ))
+    .into_owned()
+}
+
+fn is_exec_placeholder_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_exec_placeholder_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(ch) if ch == '_' || ch.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[derive(Debug)]
@@ -857,6 +1345,540 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         restore_home(original_home);
     }
 
+    #[test]
+    fn exec_template_uses_explicit_private_key() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice")
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let rendered = resolve_exec_template(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            "postgres://$db_user:$DB_PASS@localhost/app",
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "postgres://alice:super-secret@localhost/app");
+    }
+
+    #[test]
+    fn exec_template_uses_automatic_private_key_lookup() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        let original_home = std::env::var("HOME").ok();
+        let home = tempdir().unwrap();
+        let ssh_dir = home.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        fs::write(ssh_dir.join(DEFAULT_SSH_PRIVATE_KEY_NAME), SSH_RSA_PRIVATE).unwrap();
+        unsafe { std::env::set_var("HOME", home.path()) };
+
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "prod-primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_USER", "alice")
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "DB_PASS", "super-secret")
+            .unwrap();
+
+        let rendered = resolve_exec_template(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            "postgres://$DB_USER:$db_pass@localhost/app",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "postgres://alice:super-secret@localhost/app");
+        restore_home(original_home);
+    }
+
+    #[test]
+    fn secret_set_uses_inline_value_without_printing() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let resolved =
+            resolve_secret_set_input(Some("token-value".to_string()), false, &mut reader).unwrap();
+
+        assert_eq!(
+            resolved,
+            ResolvedSecretSetInput {
+                value: "token-value".to_string(),
+                print_output: false,
+            }
+        );
+    }
+
+    #[test]
+    fn secret_set_reads_stdin_and_marks_output_visible() {
+        let mut reader = std::io::Cursor::new(b"token-from-stdin".to_vec());
+
+        let resolved = resolve_secret_set_input(None, true, &mut reader).unwrap();
+
+        assert_eq!(
+            resolved,
+            ResolvedSecretSetInput {
+                value: "token-from-stdin".to_string(),
+                print_output: true,
+            }
+        );
+    }
+
+    #[test]
+    fn secret_set_rejects_value_and_stdin_together() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let err = resolve_secret_set_input(Some("token-value".to_string()), true, &mut reader)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("cannot be used together"));
+    }
+
+    #[test]
+    fn secret_set_requires_value_or_stdin() {
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let err = resolve_secret_set_input(None, false, &mut reader).unwrap_err();
+
+        assert!(err.to_string().contains("missing secret value"));
+    }
+
+    #[test]
+    fn exec_command_parses_arguments_after_double_dash() {
+        let cli = Cli::try_parse_from(["valtick", "exec", "--", "AWS_KEY=$AWS_KEY", "aws", "stg"])
+            .unwrap();
+
+        let Command::Exec(command) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert!(command.env.is_empty());
+        assert!(!command.all);
+        assert_eq!(command.argv, vec!["AWS_KEY=$AWS_KEY", "aws", "stg"]);
+    }
+
+    #[test]
+    fn exec_command_parses_env_flags_and_all_flag() {
+        let cli = Cli::try_parse_from([
+            "valtick",
+            "exec",
+            "--env",
+            "GITHUB_TOKEN",
+            "--env",
+            "AWS_ACCESS_KEY_ID",
+            "--",
+            "aws",
+            "sts",
+            "get-caller-identity",
+        ])
+        .unwrap();
+
+        let Command::Exec(command) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert_eq!(command.env, vec!["GITHUB_TOKEN", "AWS_ACCESS_KEY_ID"]);
+        assert!(!command.all);
+        assert_eq!(command.argv, vec!["aws", "sts", "get-caller-identity"]);
+
+        let cli = Cli::try_parse_from([
+            "valtick",
+            "exec",
+            "--all",
+            "--",
+            "aws",
+            "sts",
+            "get-caller-identity",
+        ])
+        .unwrap();
+
+        let Command::Exec(command) = cli.command else {
+            panic!("expected exec command");
+        };
+
+        assert!(command.env.is_empty());
+        assert!(command.all);
+        assert_eq!(command.argv, vec!["aws", "sts", "get-caller-identity"]);
+    }
+
+    #[test]
+    fn exec_invocation_resolves_env_assignments_and_preserves_args() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_PROFILE", "prod")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &[],
+            false,
+            &[
+                "AWS_KEY=$AWS_KEY".to_string(),
+                "aws".to_string(),
+                "--profile".to_string(),
+                "$aws_profile".to_string(),
+                "stg".to_string(),
+            ],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(invocation.program, "aws");
+        assert_eq!(invocation.args, vec!["--profile", "$aws_profile", "stg"]);
+        assert_eq!(
+            invocation.env_vars,
+            vec![("AWS_KEY".to_string(), "secret-access-key".to_string())]
+        );
+        assert_eq!(
+            invocation.redacted_values,
+            vec!["secret-access-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_invocation_loads_named_envs_from_workspace() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123")
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_ACCESS_KEY_ID", "AKIA123")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &["GITHUB_TOKEN".to_string(), "AWS_ACCESS_KEY_ID".to_string()],
+            false,
+            &[
+                "aws".to_string(),
+                "sts".to_string(),
+                "get-caller-identity".to_string(),
+            ],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(invocation.program, "aws");
+        assert_eq!(invocation.args, vec!["sts", "get-caller-identity"]);
+        assert_eq!(
+            invocation.env_vars,
+            vec![
+                ("GITHUB_TOKEN".to_string(), "ghp_123".to_string()),
+                ("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string()),
+            ]
+        );
+        assert_eq!(
+            invocation.redacted_values,
+            vec!["ghp_123".to_string(), "AKIA123".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_invocation_loads_all_workspace_secrets() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_ACCESS_KEY_ID", "AKIA123")
+            .unwrap();
+        store
+            .set_secret(
+                DEFAULT_WORKSPACE_NAME,
+                "AWS_SECRET_ACCESS_KEY",
+                "secret-key",
+            )
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &[],
+            true,
+            &[
+                "aws".to_string(),
+                "sts".to_string(),
+                "get-caller-identity".to_string(),
+            ],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            invocation.env_vars,
+            vec![
+                ("AWS_ACCESS_KEY_ID".to_string(), "AKIA123".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "secret-key".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            invocation.redacted_values,
+            vec!["AKIA123".to_string(), "secret-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_invocation_uses_env_name_when_assignment_value_is_empty() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &[],
+            false,
+            &["AWS_KEY=".to_string(), "aws".to_string(), "stg".to_string()],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            invocation.env_vars,
+            vec![("AWS_KEY".to_string(), "secret-access-key".to_string())]
+        );
+        assert_eq!(
+            invocation.redacted_values,
+            vec!["secret-access-key".to_string()]
+        );
+    }
+
+    #[test]
+    fn exec_assignment_overrides_env_flag_value() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "AWS_KEY", "secret-access-key")
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "OVERRIDE", "override-value")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &["AWS_KEY".to_string()],
+            false,
+            &["AWS_KEY=$OVERRIDE".to_string(), "aws".to_string()],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            invocation.env_vars,
+            vec![("AWS_KEY".to_string(), "override-value".to_string())]
+        );
+        assert_eq!(
+            invocation.redacted_values,
+            vec![
+                "secret-access-key".to_string(),
+                "override-value".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_invocation_leaves_shell_variables_in_arguments_untouched() {
+        let store = Valtick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "GITHUB_TOKEN", "ghp_123")
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_exec_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &["GITHUB_TOKEN".to_string()],
+            false,
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo \"$GITHUB_TOKEN\"; echo \"$i\"".to_string(),
+            ],
+            Some(private_key_path.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(invocation.program, "sh");
+        assert_eq!(
+            invocation.args,
+            vec!["-c", "echo \"$GITHUB_TOKEN\"; echo \"$i\""]
+        );
+        assert_eq!(
+            invocation.env_vars,
+            vec![("GITHUB_TOKEN".to_string(), "ghp_123".to_string())]
+        );
+    }
+
+    #[test]
+    fn redact_output_masks_known_secret_values() {
+        let redacted = redact_output(
+            "token=ghp_123 profile=prod key=secret-access-key",
+            &[
+                "secret-access-key".to_string(),
+                "ghp_123".to_string(),
+                "prod".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            redacted,
+            "token=[REDACTED] profile=[REDACTED] key=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn stream_redacted_output_masks_values_across_chunk_boundaries() {
+        let mut reader = ChunkedReader::new(b"prefix ghp_123 suffix".to_vec(), 3);
+        let mut writer = Vec::new();
+
+        stream_redacted_output(&mut reader, &mut writer, &["ghp_123".to_string()]).unwrap();
+
+        assert_eq!(
+            String::from_utf8(writer).unwrap(),
+            "prefix [REDACTED] suffix"
+        );
+    }
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -866,6 +1888,38 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         match original_home {
             Some(home) => unsafe { std::env::set_var("HOME", home) },
             None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    struct ChunkedReader {
+        bytes: Vec<u8>,
+        chunk_size: usize,
+        offset: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(bytes: Vec<u8>, chunk_size: usize) -> Self {
+            Self {
+                bytes,
+                chunk_size,
+                offset: 0,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+
+            let len = self
+                .chunk_size
+                .min(buf.len())
+                .min(self.bytes.len() - self.offset);
+            buf[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
         }
     }
 }

@@ -402,6 +402,27 @@ impl Valtick {
         key: &str,
         private_key_pem: &str,
     ) -> Result<String> {
+        let private_key = parse_private_key(private_key_pem)?;
+        self.decrypt_secret_with_private_key(workspace_ref, key, &private_key)
+    }
+
+    pub fn get_secret_auto<P: AsRef<Path>>(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        ssh_dir: P,
+    ) -> Result<String> {
+        let private_key_pem =
+            self.resolve_auto_private_key_pem_for_workspace(workspace_ref, ssh_dir)?;
+        self.get_secret(workspace_ref, key, &private_key_pem)
+    }
+
+    fn decrypt_secret_with_private_key(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        private_key: &RsaPrivateKey,
+    ) -> Result<String> {
         let conn = self.conn.borrow();
         let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
         let secret = Self::find_secret_by_key(&conn, &workspace.id, key)?.ok_or_else(|| {
@@ -411,8 +432,7 @@ impl Valtick {
             }
         })?;
         let recipients = Self::list_secret_recipients(&conn, &secret.metadata.id)?;
-        let private_key = parse_private_key(private_key_pem)?;
-        let dek = unwrap_secret_key(&private_key, &recipients)?;
+        let dek = unwrap_secret_key(private_key, &recipients)?;
 
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|err| ValtickError::Crypto(format!("invalid data encryption key: {err}")))?;
@@ -427,10 +447,9 @@ impl Valtick {
             .map_err(|err| ValtickError::Crypto(format!("secret is not valid UTF-8: {err}")))
     }
 
-    pub fn get_secret_auto<P: AsRef<Path>>(
+    fn resolve_auto_private_key_pem_for_workspace<P: AsRef<Path>>(
         &self,
         workspace_ref: &str,
-        key: &str,
         ssh_dir: P,
     ) -> Result<String> {
         let ssh_dir = ssh_dir.as_ref();
@@ -446,20 +465,36 @@ impl Valtick {
         }
 
         let mut attempted = Vec::new();
+        let workspace_public_keys = certificates
+            .iter()
+            .map(|certificate| {
+                parse_public_material(&certificate.cert_pem).map(|parsed| parsed.public_key)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         for candidate in candidates {
             match fs::read_to_string(&candidate.path) {
-                Ok(private_key_pem) => {
-                    match self.get_secret(workspace_ref, key, &private_key_pem) {
-                        Ok(value) => return Ok(value),
-                        Err(err) => attempted.push(format!(
-                            "{} ({}) did not work: {}",
+                Ok(private_key_pem) => match parse_private_key(&private_key_pem) {
+                    Ok(private_key) => {
+                        if workspace_public_keys.iter().any(|certificate_public_key| {
+                            *certificate_public_key == private_key.to_public_key()
+                        }) {
+                            return Ok(private_key_pem);
+                        }
+
+                        attempted.push(format!(
+                            "{} ({}) did not match any certificate saved in the workspace",
                             candidate.label,
-                            candidate.path.display(),
-                            summarize_secret_lookup_error(&err)
-                        )),
+                            candidate.path.display()
+                        ));
                     }
-                }
+                    Err(err) => attempted.push(format!(
+                        "{} ({}) did not work: {}",
+                        candidate.label,
+                        candidate.path.display(),
+                        summarize_secret_lookup_error(&err)
+                    )),
+                },
                 Err(err) => attempted.push(format!(
                     "{} ({}) could not be read: {}",
                     candidate.label,

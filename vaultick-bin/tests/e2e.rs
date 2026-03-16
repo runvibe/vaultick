@@ -1,6 +1,10 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -292,6 +296,100 @@ fn secret_set_file_accepts_binary_content() {
     assert!(String::from_utf8_lossy(&get_output.stdout).contains("\tBINARY_BLOB\t"));
 }
 
+#[test]
+fn request_redacts_response_body_and_fails_on_non_success_status() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    assert_success(
+        &env.command()
+            .args(["secret", "set", "GITHUB_TOKEN", "super-secret-token"])
+            .output()
+            .unwrap(),
+    );
+
+    let server = TestHttpServer::spawn_once(|mut stream, request| {
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer super-secret-token")
+        );
+
+        write!(
+            stream,
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\ntoken=super-secret-token",
+            "token=super-secret-token".len()
+        )
+        .unwrap();
+    });
+
+    let output = env
+        .command()
+        .args([
+            "request",
+            "--url",
+            &server.url("/"),
+            "--method",
+            "POST",
+            "--header",
+            "Authorization: Bearer $GITHUB_TOKEN",
+        ])
+        .output()
+        .unwrap();
+
+    assert_failure(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "token=[REDACTED]");
+}
+
+#[test]
+fn request_supports_json_data_and_sse_redaction() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    assert_success(
+        &env.command()
+            .args(["secret", "set", "GITHUB_TOKEN", "super-secret-token"])
+            .output()
+            .unwrap(),
+    );
+
+    let server = TestHttpServer::spawn_once(|mut stream, request| {
+        assert!(request.starts_with("GET /stream?token=super-secret-token HTTP/1.1"));
+
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.flush().unwrap();
+
+        stream.write_all(b"data: super-").unwrap();
+        stream.flush().unwrap();
+        thread::sleep(Duration::from_millis(10));
+        stream.write_all(b"secret-token\n\n").unwrap();
+        stream.flush().unwrap();
+    });
+
+    let output = env
+        .command()
+        .args([
+            "request",
+            "--data",
+            &format!(
+                "{{\"url\":\"{}\",\"headers\":{{\"Authorization\":\"Bearer $GITHUB_TOKEN\"}},\"body\":\"{{\\\"token\\\":\\\"$GITHUB_TOKEN\\\"}}\"}}",
+                server.url("/stream?token=$GITHUB_TOKEN")
+            ),
+        ])
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "data: [REDACTED]\n\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn exec_redacts_secret_output_from_child_process() {
@@ -342,4 +440,61 @@ fn assert_failure(output: &Output) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+struct TestHttpServer {
+    listener: TcpListener,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TestHttpServer {
+    fn spawn_once(handler: impl FnOnce(TcpStream, String) + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let cloned = listener.try_clone().unwrap();
+        let join_handle = thread::spawn(move || {
+            let (mut stream, _) = cloned.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            handler(stream, request);
+        });
+
+        Self {
+            listener,
+            join_handle: Some(join_handle),
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!(
+            "http://{}/{}",
+            self.listener.local_addr().unwrap(),
+            path.trim_start_matches('/')
+        )
+    }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut buffer = [0_u8; 4096];
+    let mut request = Vec::new();
+
+    loop {
+        let bytes_read = stream.read(&mut buffer).unwrap();
+        if bytes_read == 0 {
+            break;
+        }
+
+        request.extend_from_slice(&buffer[..bytes_read]);
+        if request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    String::from_utf8_lossy(&request).into_owned()
 }

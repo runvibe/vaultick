@@ -7,8 +7,10 @@ use std::thread;
 
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Select, theme::ColorfulTheme};
+use reqwest::Method;
 use rsa::BigUint;
 use rsa::pkcs8::{EncodePublicKey, LineEnding};
+use serde::Deserialize;
 use serde_json::json;
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
 use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
@@ -48,6 +50,7 @@ enum Command {
     Rsa(RsaCommand),
     Secret(SecretCommand),
     Exec(ExecCommand),
+    Request(RequestCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -141,6 +144,22 @@ struct ExecCommand {
     argv: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct RequestCommand {
+    #[arg(long = "private-key", value_name = "PEM_PATH")]
+    private_key: Option<PathBuf>,
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    #[arg(long, value_name = "METHOD")]
+    method: Option<String>,
+    #[arg(long = "header", value_name = "NAME: VALUE")]
+    header: Vec<String>,
+    #[arg(long, value_name = "TEXT")]
+    body: Option<String>,
+    #[arg(long, value_name = "JSON")]
+    data: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSecretSetInput {
     value: Vec<u8>,
@@ -156,6 +175,23 @@ enum ResolvedSecretSetRequest {
     EnvFile {
         entries: Vec<(String, String)>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRequestInvocation {
+    method: Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    redacted_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct RequestDataInput {
+    url: String,
+    method: Option<String>,
+    headers: Option<HashMap<String, String>>,
+    body: Option<String>,
 }
 
 fn main() {
@@ -186,6 +222,10 @@ fn run() -> Result<i32, Box<dyn std::error::Error>> {
         Command::Exec(command) => {
             let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
             return handle_exec(&vaultick, &workspace_ref, command);
+        }
+        Command::Request(command) => {
+            let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
+            return handle_request(&vaultick, &workspace_ref, command);
         }
     }
 
@@ -435,6 +475,32 @@ fn handle_exec(
     Ok(status.code().unwrap_or(1))
 }
 
+fn handle_request(
+    vaultick: &Vaultick,
+    workspace_ref: &str,
+    command: RequestCommand,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let invocation = resolve_request_invocation(vaultick, workspace_ref, &command)?;
+    let client = reqwest::blocking::Client::builder().build()?;
+    let mut request = client.request(invocation.method.clone(), &invocation.url);
+
+    for (name, value) in &invocation.headers {
+        request = request.header(name, value);
+    }
+
+    if let Some(body) = invocation.body {
+        request = request.body(body);
+    }
+
+    let response = request.send()?;
+    let is_success = response.status().is_success();
+
+    let mut writer = io::stdout().lock();
+    stream_redacted_output(response, &mut writer, &invocation.redacted_values)?;
+
+    Ok(if is_success { 0 } else { 1 })
+}
+
 fn resolve_secret_set_input(
     value: Option<String>,
     stdin: bool,
@@ -592,6 +658,106 @@ fn resolve_and_get_secret(
         io::Error::other("no private key candidate was found automatically; define --private-key")
     })?;
     Ok(vaultick.get_secret_auto(workspace_ref, key, &ssh_dir)?)
+}
+
+fn resolve_request_invocation(
+    vaultick: &Vaultick,
+    workspace_ref: &str,
+    command: &RequestCommand,
+) -> Result<ResolvedRequestInvocation, Box<dyn std::error::Error>> {
+    if command.data.is_some()
+        && (command.url.is_some()
+            || command.method.is_some()
+            || !command.header.is_empty()
+            || command.body.is_some())
+    {
+        return Err(io::Error::other(
+            "--data cannot be combined with --url, --method, --header, or --body",
+        )
+        .into());
+    }
+
+    let parsed = if let Some(data) = command.data.as_deref() {
+        let input: RequestDataInput = serde_json::from_str(data)?;
+        ParsedRequestInput {
+            url: input.url,
+            method: input.method,
+            headers: input
+                .headers
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            body: input.body,
+        }
+    } else {
+        ParsedRequestInput {
+            url: command
+                .url
+                .clone()
+                .ok_or_else(|| io::Error::other("missing --url or --data"))?,
+            method: command.method.clone(),
+            headers: parse_request_headers(&command.header)?,
+            body: command.body.clone(),
+        }
+    };
+
+    let mut resolver =
+        ExecTemplateResolver::new(vaultick, workspace_ref, command.private_key.as_deref())?;
+    let url = resolver.resolve_template(&parsed.url)?;
+    let method = parse_http_method(parsed.method.as_deref().unwrap_or("GET"))?;
+    let mut headers = Vec::with_capacity(parsed.headers.len());
+
+    for (name, value) in parsed.headers {
+        headers.push((name, resolver.resolve_template(&value)?));
+    }
+
+    let body = parsed
+        .body
+        .as_deref()
+        .map(|value| resolver.resolve_template(value))
+        .transpose()?;
+
+    Ok(ResolvedRequestInvocation {
+        method,
+        url,
+        headers,
+        body,
+        redacted_values: resolver.into_redacted_values(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRequestInput {
+    url: String,
+    method: Option<String>,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+}
+
+fn parse_request_headers(headers: &[String]) -> Result<Vec<(String, String)>, io::Error> {
+    let mut parsed = Vec::with_capacity(headers.len());
+
+    for header in headers {
+        let (name, value) = header.split_once(':').ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid header {header:?}; expected the format 'Name: Value'"
+            ))
+        })?;
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(io::Error::other("header name cannot be empty"));
+        }
+
+        parsed.push((name.to_string(), value.trim().to_string()));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_http_method(method: &str) -> Result<Method, io::Error> {
+    Method::from_bytes(method.trim().as_bytes())
+        .map_err(|err| io::Error::other(format!("invalid HTTP method {method:?}: {err}")))
 }
 
 fn resolve_exec_invocation(
@@ -1982,6 +2148,165 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert!(command.env.is_empty());
         assert!(command.all);
         assert_eq!(command.argv, vec!["aws", "sts", "get-caller-identity"]);
+    }
+
+    #[test]
+    fn request_command_parses_explicit_flags_and_data() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "request",
+            "--url",
+            "https://example.com",
+            "--method",
+            "POST",
+            "--header",
+            "Authorization: Bearer $TOKEN",
+            "--body",
+            "{\"token\":\"$TOKEN\"}",
+        ])
+        .unwrap();
+
+        let Command::Request(command) = cli.command else {
+            panic!("expected request command");
+        };
+
+        assert_eq!(command.url.as_deref(), Some("https://example.com"));
+        assert_eq!(command.method.as_deref(), Some("POST"));
+        assert_eq!(command.header, vec!["Authorization: Bearer $TOKEN"]);
+        assert_eq!(command.body.as_deref(), Some("{\"token\":\"$TOKEN\"}"));
+        assert!(command.data.is_none());
+
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "request",
+            "--data",
+            "{\"url\":\"https://example.com\",\"method\":\"GET\"}",
+        ])
+        .unwrap();
+
+        let Command::Request(command) = cli.command else {
+            panic!("expected request command");
+        };
+
+        assert_eq!(
+            command.data.as_deref(),
+            Some("{\"url\":\"https://example.com\",\"method\":\"GET\"}")
+        );
+    }
+
+    #[test]
+    fn request_invocation_resolves_placeholders_in_url_headers_and_body() {
+        let store = Vaultick::open(":memory:").unwrap();
+        let openssh_public = SshPublicKey::from_openssh(SSH_RSA_PUBLIC).unwrap();
+        let rsa_public =
+            ssh_rsa_public_to_public_key(openssh_public.key_data().rsa().unwrap()).unwrap();
+        let public_key_pem = rsa_public.to_public_key_pem(LineEnding::LF).unwrap();
+
+        store
+            .add_certificate(
+                DEFAULT_WORKSPACE_NAME,
+                "primary",
+                public_key_pem.as_str(),
+                None,
+            )
+            .unwrap();
+        store
+            .set_secret(DEFAULT_WORKSPACE_NAME, "TOKEN", "secret-token", false)
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let private_key_path = temp.path().join("id_rsa");
+        fs::write(&private_key_path, SSH_RSA_PRIVATE).unwrap();
+
+        let invocation = resolve_request_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &RequestCommand {
+                private_key: Some(private_key_path),
+                url: Some("https://example.com/$TOKEN".to_string()),
+                method: Some("POST".to_string()),
+                header: vec!["Authorization: Bearer $TOKEN".to_string()],
+                body: Some("{\"token\":\"$TOKEN\"}".to_string()),
+                data: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(invocation.method, Method::POST);
+        assert_eq!(invocation.url, "https://example.com/secret-token");
+        assert_eq!(
+            invocation.headers,
+            vec![(
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string()
+            )]
+        );
+        assert_eq!(
+            invocation.body.as_deref(),
+            Some("{\"token\":\"secret-token\"}")
+        );
+        assert_eq!(invocation.redacted_values, vec!["secret-token".to_string()]);
+    }
+
+    #[test]
+    fn request_invocation_rejects_invalid_header_format() {
+        let store = Vaultick::open(":memory:").unwrap();
+        let err = resolve_request_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &RequestCommand {
+                private_key: None,
+                url: Some("https://example.com".to_string()),
+                method: None,
+                header: vec!["Authorization Bearer token".to_string()],
+                body: None,
+                data: None,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("invalid header"));
+    }
+
+    #[test]
+    fn request_invocation_defaults_to_get_and_rejects_mixed_data_inputs() {
+        let store = Vaultick::open(":memory:").unwrap();
+
+        let invocation = resolve_request_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &RequestCommand {
+                private_key: None,
+                url: Some("https://example.com".to_string()),
+                method: None,
+                header: vec!["Accept: application/json".to_string()],
+                body: None,
+                data: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(invocation.method, Method::GET);
+        assert_eq!(
+            invocation.headers,
+            vec![("Accept".to_string(), "application/json".to_string())]
+        );
+
+        let err = resolve_request_invocation(
+            &store,
+            DEFAULT_WORKSPACE_NAME,
+            &RequestCommand {
+                private_key: None,
+                url: Some("https://example.com".to_string()),
+                method: None,
+                header: Vec::new(),
+                body: None,
+                data: Some("{\"url\":\"https://other.example.com\"}".to_string()),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--data cannot be combined"));
     }
 
     #[test]

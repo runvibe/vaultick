@@ -2,6 +2,10 @@
 name = "vaultick-lib"
 version = "0.1.0"
 edition = "2024"
+description = "SQLite-backed secret storage with RSA-wrapped encryption keys"
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
 
 [dependencies]
 aes-gcm = "0.10"

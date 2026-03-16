@@ -323,15 +323,15 @@ fn handle_secret(
                         .map(|secret| secret.key)
                         .collect::<std::collections::HashSet<_>>();
 
-                    if !overwrite && !skip_existing {
-                        if let Some((existing_key, _)) =
+                    if !overwrite
+                        && !skip_existing
+                        && let Some((existing_key, _)) =
                             entries.iter().find(|(key, _)| existing_keys.contains(key))
-                        {
-                            return Err(io::Error::other(format!(
-                                "secret already exists in workspace: {existing_key}; use --overwrite to update it"
-                            ))
-                            .into());
-                        }
+                    {
+                        return Err(io::Error::other(format!(
+                            "secret already exists in workspace: {existing_key}; use --overwrite to update it"
+                        ))
+                        .into());
                     }
 
                     for (key, value) in entries {

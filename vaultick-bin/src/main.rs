@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use dialoguer::{Select, theme::ColorfulTheme};
 use rsa::BigUint;
 use rsa::pkcs8::{EncodePublicKey, LineEnding};
+use serde_json::json;
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
 use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
 
@@ -105,8 +106,13 @@ enum SecretSubcommand {
     },
     Get {
         key: String,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
-    List,
+    List {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Delete {
         key: String,
     },
@@ -342,14 +348,22 @@ fn handle_secret(
                 }
             }
         }
-        SecretSubcommand::Get { key } => {
+        SecretSubcommand::Get { key, json } => {
             let secret = vaultick.get_secret_metadata(workspace_ref, &key)?;
-            print_secret_metadata(&secret);
-        }
-        SecretSubcommand::List => {
-            let secrets = vaultick.list_secrets(workspace_ref)?;
-            for secret in secrets {
+            if json {
+                print_secret_metadata_json(&secret)?;
+            } else {
                 print_secret_metadata(&secret);
+            }
+        }
+        SecretSubcommand::List { json } => {
+            let secrets = vaultick.list_secrets(workspace_ref)?;
+            if json {
+                print_secret_metadata_list_json(&secrets)?;
+            } else {
+                for secret in secrets {
+                    print_secret_metadata(&secret);
+                }
             }
         }
         SecretSubcommand::Delete { key } => {
@@ -1168,6 +1182,35 @@ fn print_secret_metadata(secret: &SecretMetadata) {
     );
 }
 
+fn print_secret_metadata_json(secret: &SecretMetadata) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&secret_metadata_json_value(secret))?
+    );
+    Ok(())
+}
+
+fn print_secret_metadata_list_json(
+    secrets: &[SecretMetadata],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = secrets
+        .iter()
+        .map(secret_metadata_json_value)
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn secret_metadata_json_value(secret: &SecretMetadata) -> serde_json::Value {
+    json!({
+        "id": secret.id,
+        "workspace_id": secret.workspace_id,
+        "key": secret.key,
+        "created_at": secret.created_at,
+        "updated_at": secret.updated_at,
+    })
+}
+
 fn resolve_workspace_ref(
     vaultick: &Vaultick,
     cli_workspace: Option<&str>,
@@ -1735,6 +1778,28 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(env_file, Some(".env".to_string()));
         assert!(skip_existing);
         assert!(!overwrite);
+    }
+
+    #[test]
+    fn secret_get_and_list_parse_json_flag() {
+        let cli = Cli::try_parse_from(["vaultick", "secret", "get", "API_KEY", "--json"]).unwrap();
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretSubcommand::Get { key, json } = command.command else {
+            panic!("expected secret get command");
+        };
+        assert_eq!(key, "API_KEY");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["vaultick", "secret", "list", "--json"]).unwrap();
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretSubcommand::List { json } = command.command else {
+            panic!("expected secret list command");
+        };
+        assert!(json);
     }
 
     #[test]

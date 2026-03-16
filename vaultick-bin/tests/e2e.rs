@@ -123,6 +123,41 @@ fn secret_set_and_get_metadata_are_case_insensitive_and_store_uppercase() {
 }
 
 #[test]
+fn secret_get_and_list_support_json_output() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    assert_success(
+        &env.command()
+            .args(["secret", "set", "google_token", "super-secret-token"])
+            .output()
+            .unwrap(),
+    );
+
+    let get_output = env
+        .command()
+        .args(["secret", "get", "google_token", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&get_output);
+    let get_json: serde_json::Value = serde_json::from_slice(&get_output.stdout).unwrap();
+    assert_eq!(get_json["key"], "GOOGLE_TOKEN");
+    assert!(get_json["id"].is_string());
+    assert!(get_json["workspace_id"].is_string());
+
+    let list_output = env
+        .command()
+        .args(["secret", "list", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&list_output);
+    let list_json: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert!(list_json.is_array());
+    assert_eq!(list_json.as_array().unwrap().len(), 1);
+    assert_eq!(list_json[0]["key"], "GOOGLE_TOKEN");
+}
+
+#[test]
 fn secret_set_requires_overwrite_flag_for_existing_key() {
     let env = TestEnv::new();
     env.setup_default_rsa();

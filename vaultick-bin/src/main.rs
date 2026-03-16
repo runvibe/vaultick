@@ -15,6 +15,9 @@ use serde_json::json;
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
 use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
 
+#[path = "../../shared/runtime.rs"]
+mod runtime;
+
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
 const DEFAULT_DB_FILENAME: &str = "database.db";
@@ -861,7 +864,7 @@ struct ExecTemplateResolver<'a> {
     vaultick: &'a Vaultick,
     workspace_ref: &'a str,
     private_key: Option<&'a Path>,
-    secret_key_index: HashMap<String, String>,
+    secret_key_index: runtime::SecretTemplateIndex,
     secret_cache: HashMap<String, String>,
     redacted_values: Vec<String>,
 }
@@ -872,38 +875,27 @@ impl<'a> ExecTemplateResolver<'a> {
         workspace_ref: &'a str,
         private_key: Option<&'a Path>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut secret_key_index = HashMap::new();
-
-        for secret in vaultick.list_secrets(workspace_ref)? {
-            let normalized_key = secret.key.to_ascii_lowercase();
-            if let Some(existing_key) = secret_key_index.insert(normalized_key, secret.key.clone())
-            {
-                return Err(io::Error::other(format!(
-                    "cannot use exec placeholder resolution because secrets {existing_key} and {} collide",
-                    secret.key
-                ))
-                .into());
-            }
-        }
-
         Ok(Self {
             vaultick,
             workspace_ref,
             private_key,
-            secret_key_index,
+            secret_key_index: runtime::SecretTemplateIndex::new(
+                vaultick
+                    .list_secrets(workspace_ref)?
+                    .into_iter()
+                    .map(|secret| secret.key),
+            )?,
             secret_cache: HashMap::new(),
             redacted_values: Vec::new(),
         })
     }
 
     fn list_secret_keys(&self) -> Vec<String> {
-        let mut keys = self.secret_key_index.values().cloned().collect::<Vec<_>>();
-        keys.sort();
-        keys
+        self.secret_key_index.keys()
     }
 
     fn resolve_template(&mut self, input: &str) -> Result<String, Box<dyn std::error::Error>> {
-        replace_exec_placeholders(input, |secret_key| {
+        runtime::replace_secret_placeholders(input, |secret_key| {
             self.resolve_secret_value_by_placeholder(secret_key)
         })
     }
@@ -914,8 +906,8 @@ impl<'a> ExecTemplateResolver<'a> {
     ) -> Result<String, Box<dyn std::error::Error>> {
         let resolved_key = self
             .secret_key_index
-            .get(&secret_key.to_ascii_lowercase())
-            .cloned()
+            .canonical_key(secret_key)
+            .map(ToString::to_string)
             .ok_or_else(|| io::Error::other(format!("secret not found: {secret_key}")))?;
 
         self.resolve_secret_value(&resolved_key)
@@ -948,57 +940,12 @@ impl<'a> ExecTemplateResolver<'a> {
     }
 }
 
-fn replace_exec_placeholders<F>(
-    input: &str,
-    mut resolve_secret: F,
-) -> Result<String, Box<dyn std::error::Error>>
-where
-    F: FnMut(&str) -> Result<String, Box<dyn std::error::Error>>,
-{
-    let mut output = String::with_capacity(input.len());
-    let mut cursor = 0;
-
-    while let Some(start_offset) = input[cursor..].find('$') {
-        let start = cursor + start_offset;
-        output.push_str(&input[cursor..start]);
-
-        let Some(first_char) = input[start + 1..].chars().next() else {
-            output.push('$');
-            cursor = start + 1;
-            break;
-        };
-
-        if !is_exec_placeholder_start(first_char) {
-            output.push('$');
-            cursor = start + 1;
-            continue;
-        }
-
-        let mut end = start + 1 + first_char.len_utf8();
-        for ch in input[end..].chars() {
-            if is_exec_placeholder_continue(ch) {
-                end += ch.len_utf8();
-            } else {
-                break;
-            }
-        }
-
-        let secret_key = &input[start + 1..end];
-        output.push_str(&resolve_secret(secret_key)?);
-        cursor = end;
-    }
-
-    output.push_str(&input[cursor..]);
-    Ok(output)
-}
-
 fn stream_redacted_output(
     mut reader: impl Read,
     writer: &mut impl Write,
     redacted_values: &[String],
 ) -> io::Result<()> {
-    let patterns = build_redaction_patterns(redacted_values);
-    let mut pending = Vec::new();
+    let mut redactor = runtime::Redactor::new(redacted_values);
     let mut buffer = [0_u8; 8192];
 
     loop {
@@ -1007,110 +954,22 @@ fn stream_redacted_output(
             break;
         }
 
-        for byte in &buffer[..bytes_read] {
-            pending.push(*byte);
-            flush_redaction_pending(writer, &mut pending, &patterns, false)?;
-        }
+        let redacted = redactor.redact_chunk(&buffer[..bytes_read]);
+        writer.write_all(&redacted)?;
         writer.flush()?;
     }
 
-    flush_redaction_pending(writer, &mut pending, &patterns, true)?;
+    writer.write_all(&redactor.finish())?;
     writer.flush()
-}
-
-fn build_redaction_patterns(redacted_values: &[String]) -> Vec<Vec<u8>> {
-    let mut patterns = redacted_values
-        .iter()
-        .filter(|value| !value.is_empty())
-        .map(|value| value.as_bytes().to_vec())
-        .collect::<Vec<_>>();
-    patterns.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
-    patterns.dedup();
-    patterns
-}
-
-#[cfg(test)]
-fn redact_bytes(bytes: &[u8], patterns: &[Vec<u8>]) -> Vec<u8> {
-    if patterns.is_empty() {
-        return bytes.to_vec();
-    }
-
-    let mut redacted = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if let Some(pattern) = patterns.iter().find(|pattern| {
-            let len = pattern.len();
-            len > 0 && index + len <= bytes.len() && bytes[index..index + len] == pattern[..]
-        }) {
-            redacted.extend_from_slice(b"[REDACTED]");
-            index += pattern.len();
-        } else {
-            redacted.push(bytes[index]);
-            index += 1;
-        }
-    }
-
-    redacted
-}
-
-fn flush_redaction_pending(
-    writer: &mut impl Write,
-    pending: &mut Vec<u8>,
-    patterns: &[Vec<u8>],
-    eof: bool,
-) -> io::Result<()> {
-    loop {
-        if pending.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(pattern) = patterns
-            .iter()
-            .find(|pattern| pending.starts_with(pattern.as_slice()))
-        {
-            let waiting_for_longer_match = !eof
-                && patterns.iter().any(|candidate| {
-                    candidate.len() > pending.len() && candidate.starts_with(pending.as_slice())
-                });
-
-            if waiting_for_longer_match {
-                return Ok(());
-            }
-
-            writer.write_all(b"[REDACTED]")?;
-            pending.drain(..pattern.len());
-            continue;
-        }
-
-        let waiting_for_partial_match = !eof
-            && patterns
-                .iter()
-                .any(|pattern| pattern.starts_with(pending.as_slice()));
-        if waiting_for_partial_match {
-            return Ok(());
-        }
-
-        writer.write_all(&pending[..1])?;
-        pending.drain(..1);
-    }
 }
 
 #[cfg(test)]
 fn redact_output(output: &str, redacted_values: &[String]) -> String {
-    String::from_utf8_lossy(&redact_bytes(
-        output.as_bytes(),
-        &build_redaction_patterns(redacted_values),
-    ))
-    .into_owned()
-}
-
-fn is_exec_placeholder_start(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphabetic()
-}
-
-fn is_exec_placeholder_continue(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
+    let mut redactor = runtime::Redactor::new(redacted_values);
+    let mut bytes = Vec::new();
+    bytes.extend(redactor.redact_chunk(output.as_bytes()));
+    bytes.extend(redactor.finish());
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {

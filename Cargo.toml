@@ -1,5 +1,5 @@
 [workspace]
-members = ["vaultick", "vaultick-bin"]
+members = ["vaultick", "vaultick-bin", "vaultick-proxy"]
 resolver = "2"
 
 [workspace.package]

@@ -1,0 +1,3 @@
+[workspace]
+members = ["valtick", "valtick-bin"]
+resolver = "2"

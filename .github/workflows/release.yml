@@ -1,238 +1,352 @@
 name: Release
 
 on:
-    workflow_dispatch:
-    push:
-        tags:
-            - "v*"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 permissions:
-    contents: write
+  contents: write
+  packages: write
 
 env:
-    CARGO_TERM_COLOR: always
-    CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  CARGO_TERM_COLOR: always
 
 jobs:
-    version_check:
-        name: Resolve version
-        runs-on: ubuntu-latest
-        outputs:
-            version: ${{ steps.version.outputs.version }}
-            tag: ${{ steps.version.outputs.tag }}
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+  resolve_version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-            - name: Resolve workspace version
-              id: version
-              shell: bash
-              run: |
-                  set -euo pipefail
+      - name: Resolve workspace version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
 
-                  workspace_version="$(
-                    awk '
-                      /^\[workspace\.package\]$/ { in_section=1; next }
-                      /^\[/ { in_section=0 }
-                      in_section && /^version[[:space:]]*=/ {
-                        match($0, /"([^"]+)"/, m)
-                        if (m[1] != "") {
-                          print m[1]
-                          exit
-                        }
-                      }
-                    ' Cargo.toml
-                  )"
+          workspace_version="$(
+            awk '
+              /^\[workspace\.package\]$/ { in_section=1; next }
+              /^\[/ { in_section=0 }
+              in_section && /^version[[:space:]]*=/ {
+                match($0, /"([^"]+)"/, m)
+                if (m[1] != "") {
+                  print m[1]
+                  exit
+                }
+              }
+            ' Cargo.toml
+          )"
 
-                  if [ -z "${workspace_version}" ]; then
-                    echo "::error::Could not resolve [workspace.package].version from Cargo.toml"
-                    exit 1
-                  fi
+          if [ -z "${workspace_version}" ]; then
+            echo "::error::Could not resolve [workspace.package].version from Cargo.toml"
+            exit 1
+          fi
 
-                  if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${workspace_version}" ]; then
-                    echo "::error::Tag ${GITHUB_REF_NAME} does not match workspace version v${workspace_version}"
-                    exit 1
-                  fi
+          echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
 
-                  echo "version=${workspace_version}" >> "${GITHUB_OUTPUT}"
-                  echo "tag=v${workspace_version}" >> "${GITHUB_OUTPUT}"
-
-    tag_release:
-        name: Create git tag
-        if: github.ref_type != 'tag'
-        needs: version_check
-        runs-on: ubuntu-latest
+      - name: Resolve release tag
+        id: tag
+        shell: bash
         env:
-            TAG: ${{ needs.version_check.outputs.tag }}
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
 
-            - name: Create tag if missing
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  git fetch --tags
+          expected_tag="v${VERSION}"
 
-                  if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-                    echo "Tag ${TAG} already exists on remote, skipping creation."
-                    exit 0
-                  fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+              echo "::error::Tag ${GITHUB_REF_NAME} does not match workspace version ${expected_tag}"
+              exit 1
+            fi
 
-                  git config user.name "github-actions"
-                  git config user.email "github-actions@github.com"
-                  git tag "${TAG}"
-                  git push origin "refs/tags/${TAG}"
+            echo "tag=${GITHUB_REF_NAME}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
 
-    build_binaries:
-        name: Build binary (${{ matrix.name }})
-        needs: [version_check, tag_release]
-        if: always() && needs.version_check.result == 'success' && (needs.tag_release.result == 'success' || needs.tag_release.result == 'skipped')
-        runs-on: ${{ matrix.runs_on }}
-        strategy:
-            fail-fast: false
-            matrix:
-                include:
-                    - name: linux-amd64
-                      runs_on: ubuntu-latest
-                      target: x86_64-unknown-linux-gnu
-                      os_slug: linux
-                      arch_slug: amd64
-                      exe_ext: ""
-                      use_cross: false
-                    - name: linux-arm64
-                      runs_on: ubuntu-latest
-                      target: aarch64-unknown-linux-gnu
-                      os_slug: linux
-                      arch_slug: arm64
-                      exe_ext: ""
-                      use_cross: true
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+          echo "tag=${expected_tag}" >> "${GITHUB_OUTPUT}"
 
-            - name: Setup Rust
-              uses: dtolnay/rust-toolchain@stable
-              with:
-                  targets: ${{ matrix.target }}
+  ensure_tag:
+    name: Ensure Release Tag
+    needs: resolve_version
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ needs.resolve_version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-            - name: Setup QEMU
-              if: matrix.use_cross == true
-              uses: docker/setup-qemu-action@v3
+      - name: Create tag if missing
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - name: Setup Buildx
-              if: matrix.use_cross == true
-              uses: docker/setup-buildx-action@v3
+          git fetch --tags
 
-            - name: Install cross
-              if: matrix.use_cross == true
-              shell: bash
-              run: cargo install cross --locked
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Tag ${TAG_NAME} already exists on remote, skipping creation."
+            exit 0
+          fi
 
-            - name: Build vaultick
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if [ "${{ matrix.use_cross }}" = "true" ]; then
-                    cross build --release --target "${{ matrix.target }}" -p vaultick
-                  else
-                    cargo build --release --target "${{ matrix.target }}" -p vaultick
-                  fi
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag "${TAG_NAME}"
 
-            - name: Prepare release asset
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  mkdir -p dist
-                  src="target/${{ matrix.target }}/release/vaultick${{ matrix.exe_ext }}"
-                  asset="vaultick-${{ matrix.os_slug }}-${{ matrix.arch_slug }}${{ matrix.exe_ext }}"
-                  cp "${src}" "dist/${asset}"
+          if git push origin "refs/tags/${TAG_NAME}"; then
+            echo "Tag ${TAG_NAME} created and pushed."
+          elif git ls-remote --exit-code --tags origin "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            echo "Tag ${TAG_NAME} was created concurrently, continuing."
+          else
+            echo "::error::Failed to push tag ${TAG_NAME}"
+            exit 1
+          fi
 
-            - name: Upload release asset
-              uses: actions/upload-artifact@v4
-              with:
-                  name: release-${{ matrix.name }}
-                  path: dist/*
-                  if-no-files-found: error
+  build_release_binaries:
+    name: Build Release Binaries (${{ matrix.name }})
+    needs: [resolve_version, ensure_tag]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+            use_cross: false
+          - name: linux-arm64
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            use_cross: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    github_release:
-        name: Publish GitHub release
-        needs: [version_check, build_binaries]
-        runs-on: ubuntu-latest
-        steps:
-            - name: Download release artifacts
-              uses: actions/download-artifact@v4
-              with:
-                  pattern: release-*
-                  merge-multiple: true
-                  path: release-assets
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-            - name: Create release and upload binaries
-              uses: softprops/action-gh-release@v2
-              with:
-                  tag_name: ${{ needs.version_check.outputs.tag }}
-                  name: Release ${{ needs.version_check.outputs.tag }}
-                  files: release-assets/*
-                  draft: false
-                  prerelease: false
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup QEMU
+        if: matrix.use_cross == true
+        uses: docker/setup-qemu-action@v3
 
-    publish_crates:
-        name: Publish crates.io packages
-        needs: [version_check, build_binaries]
-        runs-on: ubuntu-latest
-        if: env.CARGO_REGISTRY_TOKEN != ''
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+      - name: Setup Buildx
+        if: matrix.use_cross == true
+        uses: docker/setup-buildx-action@v3
 
-            - name: Setup Rust
-              uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        if: matrix.use_cross == true
+        shell: bash
+        run: cargo install cross --locked
 
-            - name: Publish vaultick-lib
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  set +e
-                  output="$(cargo publish -p vaultick-lib --no-verify 2>&1)"
-                  status=$?
-                  set -e
-                  echo "${output}"
-                  if [ ${status} -ne 0 ] && ! echo "${output}" | grep -q "already exists on crates.io index"; then
-                    exit ${status}
-                  fi
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - name: Wait for vaultick-lib indexing
-              shell: bash
-              run: sleep 30
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target "${{ matrix.target }}" -p vaultick
+            cross build --release --target "${{ matrix.target }}" -p vaultick-proxy
+          else
+            cargo build --release --target "${{ matrix.target }}" -p vaultick
+            cargo build --release --target "${{ matrix.target }}" -p vaultick-proxy
+          fi
 
-            - name: Publish vaultick-request
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  set +e
-                  output="$(cargo publish -p vaultick-request --no-verify 2>&1)"
-                  status=$?
-                  set -e
-                  echo "${output}"
-                  if [ ${status} -ne 0 ] && ! echo "${output}" | grep -q "already exists on crates.io index"; then
-                    exit ${status}
-                  fi
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            - name: Wait for vaultick-request indexing
-              shell: bash
-              run: sleep 30
+          mkdir -p dist
 
-            - name: Publish vaultick
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  set +e
-                  output="$(cargo publish -p vaultick --no-verify 2>&1)"
-                  status=$?
-                  set -e
-                  echo "${output}"
-                  if [ ${status} -ne 0 ] && ! echo "${output}" | grep -q "already exists on crates.io index"; then
-                    exit ${status}
-                  fi
+          cp "target/${{ matrix.target }}/release/vaultick" \
+            "dist/vaultick-linux-${{ matrix.arch }}"
+
+          cp "target/${{ matrix.target }}/release/vaultick-proxy" \
+            "dist/vaultick-proxy-linux-${{ matrix.arch }}"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  github_release:
+    name: Publish GitHub Release
+    needs: [resolve_version, ensure_tag, build_release_binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Create release and upload binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve_version.outputs.tag }}
+          name: Release ${{ needs.resolve_version.outputs.tag }}
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish_proxy_images:
+    name: Publish Proxy Image (${{ matrix.arch }})
+    needs: [resolve_version, ensure_tag, build_release_binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: downloaded
+
+      - name: Prepare Docker artifact layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "artifacts/vaultick-proxy/${{ matrix.arch }}"
+          cp "downloaded/vaultick-proxy-linux-${{ matrix.arch }}" \
+            "artifacts/vaultick-proxy/${{ matrix.arch }}/vaultick-proxy"
+          chmod +x "artifacts/vaultick-proxy/${{ matrix.arch }}/vaultick-proxy"
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/vaultick-proxy
+          tags: |
+            type=raw,value=latest-${{ matrix.arch }}
+            type=raw,value=${{ needs.resolve_version.outputs.version }}-${{ matrix.arch }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./vaultick-proxy/Dockerfile.artifact
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ARTIFACT_ROOT=artifacts
+            TARGETARCH=${{ matrix.arch }}
+            BIN_NAME=vaultick-proxy
+          cache-from: type=gha,scope=vaultick-proxy-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=vaultick-proxy-${{ matrix.arch }}
+
+  publish_proxy_manifest:
+    name: Publish Proxy Image Manifest
+    needs: [resolve_version, publish_proxy_images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve_version.outputs.version }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/vaultick-proxy
+        run: |
+          set -euo pipefail
+
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${VERSION}" \
+            "${IMAGE}:latest-amd64" \
+            "${IMAGE}:latest-arm64" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+  publish_crates:
+    name: Publish Crates.io Packages
+    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    needs: [resolve_version, ensure_tag]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish crates in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          publish_crate() {
+            crate="$1"
+
+            cargo package -p "${crate}" --allow-dirty --no-verify
+
+            set +e
+            output="$(cargo publish -p "${crate}" --no-verify 2>&1)"
+            status=$?
+            set -e
+
+            echo "${output}"
+
+            if [ ${status} -ne 0 ]; then
+              if echo "${output}" | grep -q "already exists on crates.io index"; then
+                echo "${crate} already published at this version, continuing."
+              else
+                exit ${status}
+              fi
+            fi
+          }
+
+          publish_crate vaultick-lib
+          sleep 30
+          publish_crate vaultick-request
+          sleep 30
+          publish_crate vaultick

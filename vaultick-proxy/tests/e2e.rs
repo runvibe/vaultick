@@ -130,14 +130,7 @@ async fn proxy_forwards_requests_and_redacts_response_body() {
         upstream = upstream_addr,
     ));
 
-    let child = Command::new(binary())
-        .args(["--config", config_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_proxy(&listen_addr).await;
-    let _guard = ChildGuard { child };
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
 
     let response = reqwest::Client::new()
         .post(format!("http://{listen_addr}/github/team?mode=test"))
@@ -169,14 +162,7 @@ async fn proxy_redacts_sse_streams() {
         upstream = upstream_addr,
     ));
 
-    let child = Command::new(binary())
-        .args(["--config", config_path.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    wait_for_proxy(&listen_addr).await;
-    let _guard = ChildGuard { child };
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
 
     let response = reqwest::Client::new()
         .get(format!("http://{listen_addr}/events"))
@@ -221,6 +207,107 @@ async fn proxy_fails_fast_when_config_references_unknown_secret() {
     assert!(stderr.contains("secret not found: MISSING_SECRET"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_returns_404_when_no_route_matches() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://127.0.0.1:1\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    ));
+
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/missing"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.text().await.unwrap(), "route not found");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_returns_502_when_upstream_is_unreachable() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let upstream_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://{upstream}\n      path: /echo\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    ));
+
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/github"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("upstream request failed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_returns_504_when_upstream_times_out() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(timeout_router()).await;
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /slow\n    forward:\n      base_url: http://{upstream}\n      path: /sleep\n      timeout_ms: 20\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    ));
+
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/slow"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert!(response.text().await.unwrap().contains("timed out"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_returns_500_when_request_body_template_needs_utf8() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(upstream_router()).await;
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://{upstream}\n      path: /echo\n      body: \"{{{{request.body}}}}\"\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    ));
+
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{listen_addr}/github"))
+        .body(vec![0xff, 0xfe, 0xfd])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(response.text().await.unwrap().contains("not valid UTF-8"));
+}
+
 async fn spawn_upstream(app: Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -228,6 +315,17 @@ async fn spawn_upstream(app: Router) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     addr.to_string()
+}
+
+async fn spawn_proxy_process(config_path: &PathBuf, listen_addr: &str) -> ChildGuard {
+    let child = Command::new(binary())
+        .args(["--config", config_path.to_str().unwrap()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_proxy(listen_addr).await;
+    ChildGuard { child }
 }
 
 fn upstream_router() -> Router {
@@ -280,6 +378,16 @@ fn sse_router() -> Router {
                 )],
                 Body::from_stream(stream),
             )
+        }),
+    )
+}
+
+fn timeout_router() -> Router {
+    Router::new().route(
+        "/sleep",
+        get(|| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            (StatusCode::OK, "slow")
         }),
     )
 }

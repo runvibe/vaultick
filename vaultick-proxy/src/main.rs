@@ -5,6 +5,7 @@ mod services;
 use std::path::PathBuf;
 
 use clap::Parser;
+use vaultick_request::BoxError;
 
 use crate::models::StartupOverrides;
 
@@ -32,7 +33,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), BoxError> {
     let cli = Cli::parse();
     let settings = services::load_settings(StartupOverrides {
         config_path: cli.config,

@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
 use serde::Deserialize;
+use vaultick_request::AsyncClient;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfigFile {
@@ -76,7 +76,7 @@ pub struct CompiledRoute {
 
 #[derive(Debug)]
 pub struct AppState {
-    pub client: Client,
+    pub client: AsyncClient,
     pub routes: Vec<CompiledRoute>,
 }
 

@@ -207,6 +207,23 @@ jobs:
               shell: bash
               run: sleep 30
 
+            - name: Publish vaultick-request
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  set +e
+                  output="$(cargo publish -p vaultick-request --no-verify 2>&1)"
+                  status=$?
+                  set -e
+                  echo "${output}"
+                  if [ ${status} -ne 0 ] && ! echo "${output}" | grep -q "already exists on crates.io index"; then
+                    exit ${status}
+                  fi
+
+            - name: Wait for vaultick-request indexing
+              shell: bash
+              run: sleep 30
+
             - name: Publish vaultick
               shell: bash
               run: |

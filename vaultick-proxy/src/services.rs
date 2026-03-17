@@ -5,23 +5,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::{Body, Bytes, to_bytes};
+use axum::body::{Body, to_bytes};
 use axum::http::header::{
-    CONNECTION, CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, TE, TRAILER, TRANSFER_ENCODING,
-    UPGRADE,
+    CONNECTION, CONTENT_LENGTH, HeaderMap, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use axum::http::{Method, Request, Response, StatusCode, Uri};
-use futures_util::StreamExt;
-use reqwest::Url;
 use vaultick::Vaultick;
+use vaultick_request::{
+    AsyncClient, BoxError, RequestBody, RequestSpec, RequestTemplateIndex, ResolvedRequest, Url,
+    collect_secret_placeholders, execute_async_with_client, replace_secret_placeholders,
+};
 
 use crate::models::{
     AppState, CompiledRoute, ProxyConfigFile, RequestContext, ResolvedSettings, RouteConfig,
     SharedAppState, StartupOverrides,
 };
-
-#[path = "../../shared/runtime.rs"]
-mod runtime;
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
@@ -29,9 +27,7 @@ const DEFAULT_DB_FILENAME: &str = "database.db";
 const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
 const VAULTICK_WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
 
-pub fn load_settings(
-    overrides: StartupOverrides,
-) -> Result<ResolvedSettings, Box<dyn std::error::Error>> {
+pub fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, BoxError> {
     let config_text = fs::read_to_string(&overrides.config_path)?;
     let file_config: ProxyConfigFile = serde_yaml::from_str(&config_text)?;
 
@@ -73,12 +69,10 @@ pub fn load_settings(
     })
 }
 
-pub fn build_state(
-    settings: &ResolvedSettings,
-) -> Result<SharedAppState, Box<dyn std::error::Error>> {
+pub fn build_state(settings: &ResolvedSettings) -> Result<SharedAppState, BoxError> {
     let vaultick = Vaultick::open(&settings.db_path)?;
     let private_key_pem = fs::read_to_string(&settings.private_key_path)?;
-    let secret_index = runtime::SecretTemplateIndex::new(
+    let secret_index = RequestTemplateIndex::new(
         vaultick
             .list_secrets(&settings.workspace)?
             .into_iter()
@@ -98,7 +92,7 @@ pub fn build_state(
     }
 
     Ok(Arc::new(AppState {
-        client: reqwest::Client::builder().build()?,
+        client: AsyncClient::builder().build()?,
         routes: compiled_routes,
     }))
 }
@@ -170,80 +164,55 @@ async fn forward_request(
     let upstream_url = build_upstream_url(&route.base_url, &path, query.as_deref())
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let mut upstream_request = state.client.request(method, upstream_url);
-
+    let mut headers = Vec::with_capacity(route.headers.len());
     for (name, value_template) in &route.headers {
         let value = render_request_template(value_template, &request_context)
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid configured header name {name:?}: {err}"),
-            )
-        })?;
-        let header_value = HeaderValue::from_str(&value).map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("invalid configured header value for {name}: {err}"),
-            )
-        })?;
-        upstream_request = upstream_request.header(header_name, header_value);
+        headers.push((name.clone(), value));
     }
 
-    if let Some(timeout) = route.timeout {
-        upstream_request = upstream_request.timeout(timeout);
-    }
-
-    if let Some(body_template) = &route.body_template {
-        let rendered_body = render_request_template(body_template, &request_context)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-        upstream_request = upstream_request.body(rendered_body);
+    let body = if let Some(body_template) = &route.body_template {
+        Some(RequestBody::Text(
+            render_request_template(body_template, &request_context)
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+        ))
     } else if !request_context.body_bytes.is_empty() {
-        upstream_request = upstream_request.body(request_context.body_bytes.clone());
-    }
+        Some(RequestBody::Bytes(request_context.body_bytes.clone()))
+    } else {
+        None
+    };
 
-    let upstream_response = upstream_request.send().await.map_err(|err| {
-        if err.is_timeout() {
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("upstream request timed out: {err}"),
-            )
-        } else {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("upstream request failed: {err}"),
-            )
-        }
-    })?;
+    let request = RequestSpec {
+        url: upstream_url.to_string(),
+        method: Some(method.as_str().to_string()),
+        headers,
+        body,
+        timeout: route.timeout,
+    };
+    let request = ResolvedRequest::from_spec(&request, |_| {
+        Err(io::Error::other("proxy request should already be fully resolved").into())
+    })
+    .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let upstream_response = execute_async_with_client(&state.client, &request)
+        .await
+        .map_err(|err| {
+            if err.is_timeout() {
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("upstream request timed out: {err}"),
+                )
+            } else {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream request failed: {err}"),
+                )
+            }
+        })?;
 
     let status = upstream_response.status();
     let headers = filter_response_headers(upstream_response.headers());
-    let body_stream = upstream_response.bytes_stream();
-    let redacted_values = route.redacted_values.clone();
-
-    let stream = async_stream::stream! {
-        let mut upstream_stream = body_stream;
-        let mut redactor = runtime::Redactor::new(&redacted_values);
-
-        while let Some(next_chunk) = upstream_stream.next().await {
-            let chunk = match next_chunk {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    yield Err::<Bytes, reqwest::Error>(err);
-                    return;
-                }
-            };
-            let redacted = redactor.redact_chunk(&chunk);
-            if !redacted.is_empty() {
-                yield Ok::<Bytes, reqwest::Error>(Bytes::from(redacted));
-            }
-        }
-
-        let tail = redactor.finish();
-        if !tail.is_empty() {
-            yield Ok::<Bytes, reqwest::Error>(Bytes::from(tail));
-        }
-    };
+    let stream = upstream_response.into_redacted_stream(&route.redacted_values);
 
     let mut response = Response::builder().status(status);
     let response_headers = response
@@ -271,8 +240,8 @@ fn resolve_default_db_path() -> Result<PathBuf, io::Error> {
 
 fn collect_referenced_secret_keys(
     routes: &[RouteConfig],
-    secret_index: &runtime::SecretTemplateIndex,
-) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    secret_index: &RequestTemplateIndex,
+) -> Result<BTreeSet<String>, BoxError> {
     let mut keys = BTreeSet::new();
 
     for route in routes {
@@ -300,12 +269,12 @@ fn collect_referenced_secret_keys(
 fn collect_template_secrets(
     template: &str,
     allow_request_placeholders: bool,
-    secret_index: &runtime::SecretTemplateIndex,
+    secret_index: &RequestTemplateIndex,
     keys: &mut BTreeSet<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), BoxError> {
     validate_request_placeholders(template, allow_request_placeholders)?;
 
-    for placeholder in runtime::collect_secret_placeholders(template) {
+    for placeholder in collect_secret_placeholders(template) {
         let canonical = secret_index
             .canonical_key(&placeholder)
             .ok_or_else(|| io::Error::other(format!("secret not found: {placeholder}")))?;
@@ -317,9 +286,9 @@ fn collect_template_secrets(
 
 fn compile_route(
     route: &RouteConfig,
-    secret_index: &runtime::SecretTemplateIndex,
+    secret_index: &RequestTemplateIndex,
     secret_values: &HashMap<String, String>,
-) -> Result<CompiledRoute, Box<dyn std::error::Error>> {
+) -> Result<CompiledRoute, BoxError> {
     let mut route_secret_keys = BTreeSet::new();
 
     let base_url = resolve_static_template(
@@ -420,13 +389,13 @@ fn compile_route(
 fn resolve_static_template(
     template: &str,
     allow_request_placeholders: bool,
-    secret_index: &runtime::SecretTemplateIndex,
+    secret_index: &RequestTemplateIndex,
     secret_values: &HashMap<String, String>,
     route_secret_keys: &mut BTreeSet<String>,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<String, BoxError> {
     validate_request_placeholders(template, allow_request_placeholders)?;
 
-    runtime::replace_secret_placeholders(template, |placeholder| {
+    replace_secret_placeholders(template, |placeholder| {
         let canonical = secret_index
             .canonical_key(placeholder)
             .ok_or_else(|| io::Error::other(format!("secret not found: {placeholder}")))?;
@@ -592,7 +561,7 @@ fn build_upstream_url(base_url: &str, path: &str, query: Option<&str>) -> Result
     Ok(url)
 }
 
-fn filter_response_headers(headers: &reqwest::header::HeaderMap) -> HeaderMap {
+fn filter_response_headers(headers: &HeaderMap) -> HeaderMap {
     let mut filtered = HeaderMap::new();
 
     for (name, value) in headers {

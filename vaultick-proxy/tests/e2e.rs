@@ -1,6 +1,6 @@
 use std::fs;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -317,7 +317,7 @@ async fn spawn_upstream(app: Router) -> String {
     addr.to_string()
 }
 
-async fn spawn_proxy_process(config_path: &PathBuf, listen_addr: &str) -> ChildGuard {
+async fn spawn_proxy_process(config_path: &Path, listen_addr: &str) -> ChildGuard {
     let child = Command::new(binary())
         .args(["--config", config_path.to_str().unwrap()])
         .stdout(Stdio::null())

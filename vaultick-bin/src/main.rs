@@ -1,22 +1,22 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 
 use clap::{Args, Parser, Subcommand};
 use dialoguer::{Select, theme::ColorfulTheme};
-use reqwest::Method;
 use rsa::BigUint;
 use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use serde_json::json;
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
 use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
-
-#[path = "../../shared/runtime.rs"]
-mod runtime;
+use vaultick_request::{
+    RequestBody, RequestSpec, RequestTemplateIndex, ResolvedRequest, execute_blocking,
+    parse_request_headers, replace_secret_placeholders, stream_redacted_output,
+};
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
@@ -182,10 +182,7 @@ enum ResolvedSecretSetRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRequestInvocation {
-    method: Method,
-    url: String,
-    headers: Vec<(String, String)>,
-    body: Option<String>,
+    request: ResolvedRequest,
     redacted_values: Vec<String>,
 }
 
@@ -484,22 +481,10 @@ fn handle_request(
     command: RequestCommand,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let invocation = resolve_request_invocation(vaultick, workspace_ref, &command)?;
-    let client = reqwest::blocking::Client::builder().build()?;
-    let mut request = client.request(invocation.method.clone(), &invocation.url);
-
-    for (name, value) in &invocation.headers {
-        request = request.header(name, value);
-    }
-
-    if let Some(body) = invocation.body {
-        request = request.body(body);
-    }
-
-    let response = request.send()?;
+    let response = execute_blocking(&invocation.request)?;
     let is_success = response.status().is_success();
-
     let mut writer = io::stdout().lock();
-    stream_redacted_output(response, &mut writer, &invocation.redacted_values)?;
+    response.copy_redacted_to_writer(&mut writer, &invocation.redacted_values)?;
 
     Ok(if is_success { 0 } else { 1 })
 }
@@ -706,25 +691,19 @@ fn resolve_request_invocation(
 
     let mut resolver =
         ExecTemplateResolver::new(vaultick, workspace_ref, command.private_key.as_deref())?;
-    let url = resolver.resolve_template(&parsed.url)?;
-    let method = parse_http_method(parsed.method.as_deref().unwrap_or("GET"))?;
-    let mut headers = Vec::with_capacity(parsed.headers.len());
-
-    for (name, value) in parsed.headers {
-        headers.push((name, resolver.resolve_template(&value)?));
-    }
-
-    let body = parsed
-        .body
-        .as_deref()
-        .map(|value| resolver.resolve_template(value))
-        .transpose()?;
+    let request = ResolvedRequest::from_spec(
+        &RequestSpec {
+            url: parsed.url,
+            method: parsed.method,
+            headers: parsed.headers,
+            body: parsed.body.map(RequestBody::Text),
+            timeout: None,
+        },
+        |secret_key| resolver.resolve_secret_value_by_placeholder(secret_key),
+    )?;
 
     Ok(ResolvedRequestInvocation {
-        method,
-        url,
-        headers,
-        body,
+        request,
         redacted_values: resolver.into_redacted_values(),
     })
 }
@@ -735,32 +714,6 @@ struct ParsedRequestInput {
     method: Option<String>,
     headers: Vec<(String, String)>,
     body: Option<String>,
-}
-
-fn parse_request_headers(headers: &[String]) -> Result<Vec<(String, String)>, io::Error> {
-    let mut parsed = Vec::with_capacity(headers.len());
-
-    for header in headers {
-        let (name, value) = header.split_once(':').ok_or_else(|| {
-            io::Error::other(format!(
-                "invalid header {header:?}; expected the format 'Name: Value'"
-            ))
-        })?;
-
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(io::Error::other("header name cannot be empty"));
-        }
-
-        parsed.push((name.to_string(), value.trim().to_string()));
-    }
-
-    Ok(parsed)
-}
-
-fn parse_http_method(method: &str) -> Result<Method, io::Error> {
-    Method::from_bytes(method.trim().as_bytes())
-        .map_err(|err| io::Error::other(format!("invalid HTTP method {method:?}: {err}")))
 }
 
 fn resolve_exec_invocation(
@@ -864,7 +817,7 @@ struct ExecTemplateResolver<'a> {
     vaultick: &'a Vaultick,
     workspace_ref: &'a str,
     private_key: Option<&'a Path>,
-    secret_key_index: runtime::SecretTemplateIndex,
+    secret_key_index: RequestTemplateIndex,
     secret_cache: HashMap<String, String>,
     redacted_values: Vec<String>,
 }
@@ -879,7 +832,7 @@ impl<'a> ExecTemplateResolver<'a> {
             vaultick,
             workspace_ref,
             private_key,
-            secret_key_index: runtime::SecretTemplateIndex::new(
+            secret_key_index: RequestTemplateIndex::new(
                 vaultick
                     .list_secrets(workspace_ref)?
                     .into_iter()
@@ -895,7 +848,7 @@ impl<'a> ExecTemplateResolver<'a> {
     }
 
     fn resolve_template(&mut self, input: &str) -> Result<String, Box<dyn std::error::Error>> {
-        runtime::replace_secret_placeholders(input, |secret_key| {
+        replace_secret_placeholders(input, |secret_key| {
             self.resolve_secret_value_by_placeholder(secret_key)
         })
     }
@@ -940,32 +893,9 @@ impl<'a> ExecTemplateResolver<'a> {
     }
 }
 
-fn stream_redacted_output(
-    mut reader: impl Read,
-    writer: &mut impl Write,
-    redacted_values: &[String],
-) -> io::Result<()> {
-    let mut redactor = runtime::Redactor::new(redacted_values);
-    let mut buffer = [0_u8; 8192];
-
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        let redacted = redactor.redact_chunk(&buffer[..bytes_read]);
-        writer.write_all(&redacted)?;
-        writer.flush()?;
-    }
-
-    writer.write_all(&redactor.finish())?;
-    writer.flush()
-}
-
 #[cfg(test)]
 fn redact_output(output: &str, redacted_values: &[String]) -> String {
-    let mut redactor = runtime::Redactor::new(redacted_values);
+    let mut redactor = vaultick_request::Redactor::new(redacted_values);
     let mut bytes = Vec::new();
     bytes.extend(redactor.redact_chunk(output.as_bytes()));
     bytes.extend(redactor.finish());
@@ -2091,18 +2021,20 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         )
         .unwrap();
 
-        assert_eq!(invocation.method, Method::POST);
-        assert_eq!(invocation.url, "https://example.com/secret-token");
+        assert_eq!(invocation.request.method.as_str(), "POST");
+        assert_eq!(invocation.request.url, "https://example.com/secret-token");
         assert_eq!(
-            invocation.headers,
+            invocation.request.headers,
             vec![(
                 "Authorization".to_string(),
                 "Bearer secret-token".to_string()
             )]
         );
         assert_eq!(
-            invocation.body.as_deref(),
-            Some("{\"token\":\"secret-token\"}")
+            invocation.request.body,
+            Some(RequestBody::Text(
+                "{\"token\":\"secret-token\"}".to_string()
+            ))
         );
         assert_eq!(invocation.redacted_values, vec!["secret-token".to_string()]);
     }
@@ -2145,9 +2077,9 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         )
         .unwrap();
 
-        assert_eq!(invocation.method, Method::GET);
+        assert_eq!(invocation.request.method.as_str(), "GET");
         assert_eq!(
-            invocation.headers,
+            invocation.request.headers,
             vec![("Accept".to_string(), "application/json".to_string())]
         );
 

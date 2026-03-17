@@ -2304,13 +2304,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dialoguer",
- "reqwest",
  "rsa",
  "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "vaultick-lib",
+ "vaultick-request",
 ]
 
 [[package]]
@@ -2349,6 +2349,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "vaultick-lib",
+ "vaultick-request",
+]
+
+[[package]]
+name = "vaultick-request"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures-util",
+ "http",
+ "reqwest",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

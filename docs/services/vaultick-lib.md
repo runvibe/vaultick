@@ -1,6 +1,7 @@
 # vaultick-lib
 
-`vaultick-lib` is the core Rust library of the project.
+`vaultick-lib` is a technical reference crate behind the main operator-facing
+products, `vaultick` and `vaultick-proxy`.
 
 It owns:
 

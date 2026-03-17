@@ -1,7 +1,7 @@
 # vaultick-request
 
-`vaultick-request` is the shared Rust library for secret-aware outbound HTTP
-execution.
+`vaultick-request` is a technical reference crate behind the main user-facing
+products, `vaultick` and `vaultick-proxy`.
 
 It is used by:
 

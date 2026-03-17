@@ -2,39 +2,40 @@
 
 This folder contains the detailed documentation for the `vaultick` project.
 
-Use this page as the main index when you want to go deeper than the project
-README.
+The main reading path is centered on:
 
-## Start here
+- `vaultick` for operators
+- `vaultick-proxy` for service and deployment workflows
 
-- [Security model](security.md)
-- [Secrets resource](resources/secrets.md)
-- [RSA certificates resource](resources/rsa.md)
+## Main reading path
+
+- [vaultick CLI guide](services/vaultick-cli.md)
+- [vaultick-proxy guide](services/vaultick-proxy.md)
+- [Secrets reference](resources/secrets.md)
+- [RSA certificates reference](resources/rsa.md)
 - [HTTP requests and proxy forwarding](resources/http.md)
+- [Security model](security.md)
 
-## Services
+## Suggested paths
+
+### If you operate vaultick from the terminal
+
+1. [vaultick CLI guide](services/vaultick-cli.md)
+2. [Secrets reference](resources/secrets.md)
+3. [RSA certificates reference](resources/rsa.md)
+4. [Security model](security.md)
+
+### If you deploy or run the proxy
+
+1. [vaultick-proxy guide](services/vaultick-proxy.md)
+2. [HTTP requests and proxy forwarding](resources/http.md)
+3. [Secrets reference](resources/secrets.md)
+4. [Security model](security.md)
+
+## Technical reference
+
+These pages are still part of the project, but they are secondary to the main
+operator and service guides.
 
 - [vaultick-lib](services/vaultick-lib.md)
-- [vaultick CLI](services/vaultick-cli.md)
 - [vaultick-request](services/vaultick-request.md)
-- [vaultick-proxy](services/vaultick-proxy.md)
-
-## Suggested reading paths
-
-### If you want to use vaultick as an operator
-
-1. [vaultick CLI](services/vaultick-cli.md)
-2. [Secrets resource](resources/secrets.md)
-3. [RSA certificates resource](resources/rsa.md)
-
-### If you want to use vaultick in HTTP workflows
-
-1. [vaultick-request](services/vaultick-request.md)
-2. [HTTP requests and proxy forwarding](resources/http.md)
-3. [vaultick-proxy](services/vaultick-proxy.md)
-
-### If you want to embed the core logic in Rust
-
-1. [vaultick-lib](services/vaultick-lib.md)
-2. [vaultick-request](services/vaultick-request.md)
-3. [Security model](security.md)

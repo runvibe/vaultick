@@ -1,39 +1,46 @@
 # vaultick-proxy
 
-`vaultick-proxy` is a config-driven reverse proxy service that forwards incoming
-HTTP requests to upstream targets while injecting secrets and redacting the
-response before it reaches the client.
+`vaultick-proxy` is the service-facing product in the `vaultick` stack.
 
-## Main responsibilities
+Use it when you want an HTTP endpoint that:
 
-- load route config from YAML or JSON sources
-- match incoming requests by path prefix
-- build upstream requests using route templates
-- resolve `$SECRET` placeholders through `vaultick-lib`
-- resolve `{{request.*}}` placeholders from the incoming request
+- receives inbound requests
+- transforms them into upstream requests
+- injects secrets from `vaultick`
+- redacts secret leaks from upstream responses before returning them
+
+## What the proxy does
+
+For every configured route, the proxy can:
+
+- match by path prefix
+- build an upstream URL
+- set or transform method, path, query, headers and body
+- resolve `$SECRET_NAME` from the `vaultick` database
+- resolve `{{request.*}}` from the incoming request
 - stream the upstream response back to the client
-- redact known in-use secrets from that streamed response
+- redact matching in-use secrets from that stream
 
 ## Startup model
 
-The proxy is started with:
+Start the proxy with a file-based config:
 
 ```bash
 vaultick-proxy --config ./vaultick-proxy.yaml
 ```
 
-It also supports env-based config resolution through `VAULTICK_CONFIG`.
+Or drive it from `VAULTICK_CONFIG`.
 
-Supported sources are:
+Supported `VAULTICK_CONFIG` sources:
 
-- inline JSON string
-- inline YAML string
+- inline JSON
+- inline YAML
 - URL
 - filesystem path
 - base64-encoded JSON or YAML string
 
-When the source is a URL, `VAULTICK_CONFIG_HEADERS` may supply fetch headers as a
-JSON object.
+When `VAULTICK_CONFIG` is a URL, `VAULTICK_CONFIG_HEADERS` may provide fetch
+headers as a JSON object.
 
 Precedence is:
 
@@ -62,9 +69,13 @@ Route fields:
 - `forward.body`
 - `forward.timeout_ms`
 
-## Request template variables
+## Template model
 
-The proxy supports these request-context placeholders:
+Secrets:
+
+- `$SECRET_NAME`
+
+Incoming-request context:
 
 - `{{request.method}}`
 - `{{request.path}}`
@@ -73,17 +84,22 @@ The proxy supports these request-context placeholders:
 - `{{request.header.<name>}}`
 - `{{request.body}}`
 
-Secrets continue to use `$SECRET_NAME`.
+This allows patterns such as:
+
+- passing through an incoming method
+- forwarding part of the path tail
+- copying an inbound header into the upstream request
+- combining static configuration with a secret-backed auth header
 
 ## Forwarding behavior
 
 The proxy:
 
-- matches routes in order
+- evaluates routes in order
 - uses the first matching path prefix
 - preserves the upstream status code
 - copies upstream response headers except hop-by-hop headers
-- streams the upstream response body to the downstream client
+- streams the upstream body to the downstream client
 
 On error:
 
@@ -94,15 +110,15 @@ On error:
 
 ## Redaction behavior
 
-The proxy pre-resolves the secrets required by the configured routes.
+The proxy pre-resolves the secrets needed by the configured routes.
 
-When an upstream response includes one of those in-use values:
+If an upstream response includes one of those in-use values:
 
-- the streamed output is redacted before the client receives it
+- the outgoing response is redacted before the client receives it
 
-This includes:
+This applies to:
 
-- normal bodies
+- normal response bodies
 - chunked transfer
 - SSE
 
@@ -125,14 +141,28 @@ routes:
         Accept: "application/vnd.github+json"
 ```
 
-## Deployment notes
+## Example deployment flow
 
-`vaultick-proxy` is meant to run well as a service, especially in containers.
+1. mount the database and private key into the container
+2. provide config via `--config` or `VAULTICK_CONFIG`
+3. start `vaultick-proxy`
+4. send requests to the local listener
+5. let the proxy forward to upstreams with secret injection and redaction
 
-Common deployment patterns:
+Example:
+
+```bash
+export VAULTICK_CONFIG="$(cat ./vaultick-proxy.yaml)"
+vaultick-proxy
+```
+
+## Container and CI usage
+
+`vaultick-proxy` is designed to run well in Docker and CI/CD environments.
+
+Common patterns:
 
 - mount a config file and use `--config`
-- inject `VAULTICK_CONFIG` directly as YAML or JSON
-- load `VAULTICK_CONFIG` from a remote URL
-- ship the binary in a Docker image and mount only the database, private key and
-  config
+- inject inline YAML/JSON through `VAULTICK_CONFIG`
+- store config remotely and point `VAULTICK_CONFIG` at a URL
+- ship the proxy image and mount only the database plus private key at runtime

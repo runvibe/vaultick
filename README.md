@@ -1,60 +1,79 @@
 # vaultick
 
-`vaultick` is a secret-management stack built to store secrets locally, use them
-in CLIs and HTTP workflows, and avoid revealing their raw values during normal
-operations.
+`vaultick` is a secret-management product for operators and platform teams that
+need to store secrets locally, use them in CLI workflows, and forward them
+safely through HTTP services without turning the terminal into a secret dump.
 
-At the center of the project is a simple rule:
+The two primary user-facing pieces are:
+
+- `vaultick`: the CLI for managing secrets, RSA access, process execution and
+  outbound HTTP requests
+- `vaultick-proxy`: the reverse proxy service for route-based forwarding with
+  secret injection and streamed redaction
+
+At the center of the project is one rule:
 
 - secrets may be stored
 - secrets may be used
-- secrets should not be printed back to the user by management commands
+- secrets should not be printed back to operators by normal management commands
 
-## What vaultick includes
+## Summary
 
-The workspace is split into four parts:
+- [Why vaultick](#why-vaultick)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [CLI capabilities](#cli-capabilities)
+- [vaultick-proxy](#vaultick-proxy)
+- [Security model](#security-model)
+- [Detailed documentation](#detailed-documentation)
 
-- `vaultick-lib`: encrypted storage, SQLite persistence, RSA access control and
-  secret lifecycle rules
-- `vaultick`: the CLI for workspaces, RSA certificates, secret management,
-  process execution and outbound HTTP requests
-- `vaultick-request`: the shared Rust library that resolves `$SECRET`
-  placeholders, executes HTTP requests and redacts responses
-- `vaultick-proxy`: a reverse proxy service that forwards requests to upstreams,
-  injects secrets and redacts streamed responses
+## Why vaultick
 
-## Main resources
+`vaultick` is built for workflows like:
 
-The project revolves around a few core concepts:
+- storing local or team secrets in SQLite with strong encryption
+- using those secrets in shell commands without echoing them back
+- making HTTP requests with internal `$SECRET` substitution
+- exposing a reverse proxy that injects secrets into upstream requests
+- redacting secrets if they appear in child process output or upstream responses
 
-- `workspace`: a logical namespace for certificates and secrets
-- `rsa certificate`: a public key allowed to decrypt secret envelopes inside a
-  workspace
-- `secret`: a key/value entry stored encrypted in SQLite
-- `request`: an outbound HTTP invocation that may resolve secrets internally
-- `proxy route`: a config-driven mapping from an incoming request to an upstream
-  target
+In practice:
 
-## Security model
+- operators mainly use `vaultick`
+- services and deployments mainly use `vaultick-proxy`
+- internal crates such as `vaultick-lib` and `vaultick-request` exist to support
+  those two products
 
-`vaultick` is intentionally opinionated:
+## Install
 
-- `secret list` returns metadata only
-- `secret get` returns metadata for a single key only
-- `secret set` never prints the stored value
-- `exec` injects secrets into a child process and redacts known secret values
-  from `stdout` and `stderr`
-- `request` resolves secrets internally and redacts matching values from the
-  response body, including streaming output
-- `vaultick-proxy` does the same redaction before returning upstream responses
-  to clients
+Build the workspace:
 
-The private key is not stored in SQLite. It is read from disk only when the
-system needs to decrypt a secret for an internal operation.
+```bash
+cargo build --release --workspace
+```
+
+Build the CLI only:
+
+```bash
+cargo build --release -p vaultick
+```
+
+Build the proxy only:
+
+```bash
+cargo build --release -p vaultick-proxy
+```
+
+Run without installing:
+
+```bash
+cargo run -p vaultick -- --help
+cargo run -p vaultick-proxy -- --help
+```
 
 ## Quick start
 
-### 1. Set a home directory
+### 1. Configure a home directory
 
 ```bash
 export VAULTICK_HOME="$HOME/.vaultick"
@@ -72,8 +91,8 @@ Workspace resolution order is:
 2. `VAULTICK_WORKSPACE`
 3. `default`
 
-When a new database is created, `vaultick` automatically creates the
-`default` workspace.
+When a new database is created, `vaultick` automatically seeds the `default`
+workspace.
 
 ### 2. Create or reuse an RSA keypair
 
@@ -81,19 +100,52 @@ When a new database is created, `vaultick` automatically creates the
 ssh-keygen -t rsa -b 4096 -f "$HOME/.ssh/id_rsa"
 ```
 
-### 3. Attach the public key to a workspace
+### 3. Attach a public key to the workspace
+
+Manual flow:
 
 ```bash
 vaultick rsa add --label id_rsa --cert "$HOME/.ssh/id_rsa.pub"
 ```
 
-### 4. Store a secret
+Auto-discovery flow:
+
+```bash
+vaultick rsa add --auto
+```
+
+### 4. Store secrets
+
+Inline:
 
 ```bash
 vaultick secret set GITHUB_TOKEN ghp_xxx
 ```
 
-### 5. Use the secret inside a process
+From stdin:
+
+```bash
+printf 'ghp_xxx' | vaultick secret set GITHUB_TOKEN --stdin
+```
+
+From a file:
+
+```bash
+vaultick secret set TLS_CERT --file ./cert.pem
+vaultick secret set BINARY_BLOB --file ./payload.bin
+```
+
+From `.env`:
+
+```bash
+vaultick secret set --env-file .env
+vaultick secret set --env-file .env --skip-existing
+vaultick secret set --env-file .env --overwrite
+```
+
+### 5. Use a secret in a process
+
+Inject selected keys:
 
 ```bash
 vaultick exec --env GITHUB_TOKEN -- sh -c 'curl -s \
@@ -102,67 +154,230 @@ vaultick exec --env GITHUB_TOKEN -- sh -c 'curl -s \
   https://api.github.com/user'
 ```
 
-### 6. Use the secret in an HTTP request
+Inject everything from the workspace:
+
+```bash
+vaultick exec --all -- sh -c 'env | sort'
+```
+
+### 6. Use a secret in an HTTP request
+
+Explicit request form:
 
 ```bash
 vaultick request \
   --url https://api.github.com/user \
+  --method GET \
   --header 'Authorization: Bearer $GITHUB_TOKEN' \
   --header 'Accept: application/vnd.github+json'
 ```
 
-## Main capabilities
+JSON request form:
 
-### Secret storage
+```bash
+vaultick request --data '{
+  "url":"https://api.github.com/user",
+  "method":"GET",
+  "headers":{
+    "Authorization":"Bearer $GITHUB_TOKEN",
+    "Accept":"application/vnd.github+json"
+  }
+}'
+```
 
-- SQLite-backed local storage
-- AES-256-GCM for secret payloads
-- per-secret wrapped data encryption keys
-- workspace isolation
-- secret keys normalized to uppercase
-- support for string values, `stdin`, `.env` imports and binary files
+## CLI capabilities
 
-### Access control
+`vaultick` is the main operator interface.
 
-- RSA public keys attached to workspaces
-- secrets may be opened by matching private keys only
-- support for multiple certificates per workspace
-- rewrap flow for new certificates in workspaces with existing secrets
+### `workspace`
 
-### Safe consumption
+Manage logical containers of secrets and RSA certificates.
 
-- `exec --env` to inject selected secrets into a child process
-- `exec --all` to inject all workspace secrets
-- `request` to perform outbound HTTP calls with internal secret substitution
-- `vaultick-proxy` to expose a reverse proxy with route-based transformations
+```bash
+vaultick workspace create app-prod
+vaultick workspace list
+vaultick workspace get app-prod
+vaultick workspace delete app-prod
+```
 
-### Response redaction
+### `rsa`
 
-- CLI process output is redacted when it contains a known in-use secret
-- HTTP responses are redacted before reaching the user
-- streamed responses and SSE are redacted incrementally
+Manage public keys allowed to unwrap workspace secrets.
 
-## Documentation map
+```bash
+vaultick rsa add --label primary --cert ./primary.pub
+vaultick rsa add --auto
+vaultick rsa list
+vaultick rsa delete <id-or-fingerprint>
+```
 
-The detailed documentation lives in `docs/`.
+### `secret`
 
-### Overview
+Store secret values and inspect secret metadata.
 
-- [Documentation index](docs/README.md)
+```bash
+vaultick secret set DATABASE_URL postgres://...
+vaultick secret get DATABASE_URL
+vaultick secret get DATABASE_URL --json
+vaultick secret list
+vaultick secret list --json
+vaultick secret delete DATABASE_URL
+```
+
+Important behavior:
+
+- key names are case-insensitive at the interface
+- stored key names are normalized to uppercase
+- `secret get` and `secret list` return metadata only
+- `set` fails on conflicts unless `--overwrite` is used
+
+### `exec`
+
+Use `exec` when you want a child process to receive secrets as environment
+variables.
+
+Main forms:
+
+```bash
+vaultick exec --env KEY -- command ...
+vaultick exec --all -- command ...
+vaultick exec -- KEY='$KEY' command ...
+```
+
+The CLI captures process output and redacts known in-use secrets before printing
+it back to the terminal.
+
+### `request`
+
+Use `request` when you want `vaultick` to perform an outbound HTTP call with
+secret substitution handled internally.
+
+Main forms:
+
+```bash
+vaultick request --url ... --method ... --header ... --body ...
+vaultick request --data '{"url":"...","headers":{"Authorization":"Bearer $TOKEN"}}'
+```
+
+Supported placeholder locations:
+
+- URL
+- headers
+- body
+
+The response body is streamed to standard output only after matching secret
+values have been redacted.
+
+## vaultick-proxy
+
+`vaultick-proxy` is the service counterpart of the CLI request flow.
+
+It listens for inbound HTTP traffic, matches routes by path prefix, builds
+upstream requests with secrets and request-context placeholders, and returns the
+upstream response after redaction.
+
+### What it does
+
+- loads config from YAML or JSON
+- supports config via `--config` or `VAULTICK_CONFIG`
+- resolves `$SECRET_NAME` through the `vaultick` database
+- resolves `{{request.*}}` from the incoming request
+- streams upstream responses back to clients
+- redacts in-use secrets in normal responses, chunked responses and SSE
+
+### Start the proxy
+
+```bash
+vaultick-proxy --config ./vaultick-proxy.yaml
+```
+
+It can also load configuration from `VAULTICK_CONFIG` as:
+
+- inline JSON
+- inline YAML
+- URL
+- file path
+- base64-encoded JSON or YAML
+
+If `VAULTICK_CONFIG` is a URL, optional fetch headers may be provided with:
+
+```bash
+export VAULTICK_CONFIG_HEADERS='{"Authorization":"Bearer token"}'
+```
+
+### Minimal config example
+
+```yaml
+listen: 127.0.0.1:8080
+db: /app/.vaultick/databases/database.db
+workspace: default
+private_key: /app/.ssh/id_rsa
+routes:
+  - match:
+      path_prefix: /github
+    forward:
+      base_url: https://api.github.com
+      method: "{{request.method}}"
+      path: /user
+      headers:
+        Authorization: "Bearer $GITHUB_TOKEN"
+        Accept: "application/vnd.github+json"
+```
+
+### Example run
+
+```bash
+vaultick-proxy --config ./vaultick-proxy.yaml
+curl -s http://127.0.0.1:8080/github
+```
+
+### Deployment model
+
+`vaultick-proxy` is designed to run as a service, especially in Docker or
+container platforms.
+
+Typical deployment patterns:
+
+- mount config and start with `--config`
+- inject config through `VAULTICK_CONFIG`
+- mount the SQLite database and private key into the container
+- publish a multi-arch proxy image from CI
+
+## Security model
+
+`vaultick` is deliberately conservative about secret visibility.
+
+- `secret list` returns metadata only
+- `secret get` returns metadata only
+- `secret set` never echoes the stored value
+- `exec` redacts secrets from child process output
+- `request` redacts secrets from HTTP responses
+- `vaultick-proxy` redacts secrets before sending upstream responses downstream
+
+Private keys are never stored in SQLite. They are loaded from disk only when a
+secret must be used internally.
+
+`vaultick` reduces accidental exposure, but it does not remove the fact that a
+child process or an upstream service may receive the secret if you explicitly
+inject it into that workflow.
+
+## Detailed documentation
+
+The detailed docs live in [docs/README.md](/home/assis/projects/cloudvibe/valtick/docs/README.md).
+
+### Main operator and deployment docs
+
+- [vaultick CLI guide](docs/services/vaultick-cli.md)
+- [vaultick-proxy guide](docs/services/vaultick-proxy.md)
+- [Secrets reference](docs/resources/secrets.md)
+- [RSA reference](docs/resources/rsa.md)
+- [HTTP requests and proxy forwarding](docs/resources/http.md)
 - [Security model](docs/security.md)
 
-### Services
+### Technical reference
 
 - [vaultick-lib](docs/services/vaultick-lib.md)
-- [vaultick CLI](docs/services/vaultick-cli.md)
 - [vaultick-request](docs/services/vaultick-request.md)
-- [vaultick-proxy](docs/services/vaultick-proxy.md)
-
-### Resources
-
-- [Secrets](docs/resources/secrets.md)
-- [RSA certificates](docs/resources/rsa.md)
-- [HTTP requests and proxy forwarding](docs/resources/http.md)
 
 ## Development
 
@@ -173,14 +388,4 @@ cargo fmt --all
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo build --release --workspace
-```
-
-## Repository layout
-
-```text
-vaultick/             vaultick-lib crate
-vaultick-bin/         vaultick CLI crate
-vaultick-request/     shared request/redaction crate
-vaultick-proxy/       reverse proxy service
-docs/                 project documentation
 ```

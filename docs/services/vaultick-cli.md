@@ -1,16 +1,16 @@
 # vaultick CLI
 
-`vaultick` is the user-facing command line interface for the project.
+`vaultick` is the main operator interface of the project.
 
-It manages:
+Use it when you want to:
 
-- workspaces
-- RSA certificates
-- secret metadata and storage
-- secret-backed process execution
-- secret-backed HTTP requests
+- create or select workspaces
+- register RSA readers
+- store secrets safely
+- inject secrets into shell commands
+- make HTTP requests without revealing stored values
 
-## Global behavior
+## Runtime defaults
 
 ### Database resolution
 
@@ -22,7 +22,8 @@ Otherwise the CLI uses:
 VAULTICK_HOME/databases/database.db
 ```
 
-If `VAULTICK_HOME` is missing, the CLI fails with guidance.
+If `VAULTICK_HOME` is missing, the CLI fails with guidance instead of guessing a
+path.
 
 ### Workspace resolution
 
@@ -32,46 +33,93 @@ The workspace is resolved in this order:
 2. `VAULTICK_WORKSPACE`
 3. `default`
 
+## Recommended operator flow
+
+### 1. Configure home and workspace
+
+```bash
+export VAULTICK_HOME="$HOME/.vaultick"
+export VAULTICK_WORKSPACE=default
+```
+
+### 2. Attach an RSA certificate
+
+Manual:
+
+```bash
+vaultick rsa add --label id_rsa --cert "$HOME/.ssh/id_rsa.pub"
+```
+
+Auto-discovery:
+
+```bash
+vaultick rsa add --auto
+```
+
+### 3. Store secrets
+
+```bash
+vaultick secret set GITHUB_TOKEN ghp_xxx
+vaultick secret set API_KEY --file ./key.txt
+vaultick secret set --env-file .env --skip-existing
+```
+
+### 4. Use them
+
+```bash
+vaultick exec --env GITHUB_TOKEN -- sh -c 'echo "$GITHUB_TOKEN"'
+vaultick request --url https://api.github.com/user --header 'Authorization: Bearer $GITHUB_TOKEN'
+```
+
 ## Command groups
 
 ### `workspace`
 
-Use this group to manage logical containers of secrets and certificates.
+Use this group to manage logical containers of secrets and RSA certificates.
 
-Supported commands:
-
-- `workspace create <name>`
-- `workspace list`
-- `workspace get <ref>`
-- `workspace delete <ref>`
+```bash
+vaultick workspace create app-prod
+vaultick workspace list
+vaultick workspace get app-prod
+vaultick workspace delete app-prod
+```
 
 ### `rsa`
 
-Use this group to manage the public keys allowed to unwrap secrets.
+Use this group to manage who can read a workspace.
 
-Supported commands:
+```bash
+vaultick rsa add --label primary --cert ./public.pem
+vaultick rsa add --auto
+vaultick rsa list
+vaultick rsa delete <id-or-fingerprint>
+```
 
-- `rsa add --label <label> --cert <path>`
-- `rsa add --auto`
-- `rsa list`
-- `rsa delete <ref>`
-
-`--auto` scans `~/.ssh`, finds usable `.pub` files with matching private keys
-and lets the user choose from a TUI list.
+`--auto` scans `~/.ssh`, validates `.pub` files with matching private keys and
+lets the operator choose from a TUI.
 
 ### `secret`
 
-Use this group to manage stored secret entries.
+Use this group to store values and inspect metadata.
 
-Supported commands:
+Supported storage flows:
 
-- `secret set <KEY> <VALUE>`
-- `secret set <KEY> --stdin`
-- `secret set <KEY> --file <path>`
-- `secret set --env-file <path>`
-- `secret get <KEY>`
-- `secret list`
-- `secret delete <KEY>`
+```bash
+vaultick secret set TOKEN abc123
+printf 'abc123' | vaultick secret set TOKEN --stdin
+vaultick secret set TOKEN --file ./token.txt
+vaultick secret set --env-file .env
+```
+
+Supported inspection flows:
+
+```bash
+vaultick secret get TOKEN
+vaultick secret get TOKEN --json
+vaultick secret list
+vaultick secret list --json
+vaultick secret delete TOKEN
+```
 
 Important behavior:
 
@@ -82,34 +130,40 @@ Important behavior:
 - use `--skip-existing` with `--env-file` to keep existing values untouched
 - `get` and `list` return metadata only
 
-`--json` is available on:
-
-- `secret get`
-- `secret list`
-
 ### `exec`
 
-Use this command to run a child process with secrets injected as environment
+Use `exec` to run a child process with secrets injected as environment
 variables.
 
 Main forms:
 
-- `exec --env KEY -- command ...`
-- `exec --all -- command ...`
-- `exec -- KEY='$KEY' command ...`
+```bash
+vaultick exec --env KEY -- command ...
+vaultick exec --all -- command ...
+vaultick exec -- KEY='$KEY' command ...
+```
 
-The CLI resolves the required secrets internally, runs the command, and redacts
-known secret values from the child output.
+Examples:
+
+```bash
+vaultick exec --env AWS_ACCESS_KEY_ID --env AWS_SECRET_ACCESS_KEY -- aws sts get-caller-identity
+vaultick exec --all -- sh -c 'env | sort'
+```
+
+The CLI resolves the required secrets internally, runs the command and redacts
+matching secret values from the child output stream.
 
 ### `request`
 
-Use this command to make outbound HTTP requests with internal secret
-substitution.
+Use `request` to make outbound HTTP calls with secret substitution handled
+inside `vaultick`.
 
 Supported forms:
 
-- `request --url ... --method ... --header ... --body ...`
-- `request --data '{"url":"...","headers":{"Authorization":"Bearer $TOKEN"}}'`
+```bash
+vaultick request --url ... --method ... --header ... --body ...
+vaultick request --data '{"url":"...","headers":{"Authorization":"Bearer $TOKEN"}}'
+```
 
 Supported placeholder locations:
 
@@ -117,13 +171,19 @@ Supported placeholder locations:
 - headers
 - body
 
-The response body is written to standard output, but known secret values used in
-that request are redacted first.
+Examples:
 
-## Recommended operator flow
+```bash
+vaultick request \
+  --url https://api.github.com/user \
+  --header 'Authorization: Bearer $GITHUB_TOKEN'
 
-1. define `VAULTICK_HOME`
-2. add an RSA certificate to the target workspace
-3. store secrets
-4. use `exec` for processes and `request` for outbound HTTP calls
-5. use `secret get` and `secret list` only for metadata inspection
+vaultick request --data '{
+  "url":"https://api.github.com/user/repos",
+  "method":"GET",
+  "headers":{"Authorization":"Bearer $GITHUB_TOKEN"}
+}'
+```
+
+The response body is streamed to standard output only after matching in-use
+secrets have been redacted.

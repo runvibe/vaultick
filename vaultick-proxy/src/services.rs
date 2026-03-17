@@ -723,6 +723,7 @@ mod tests {
     use std::collections::HashMap;
     use std::env::remove_var;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
 
     use base64::Engine;
 
@@ -732,6 +733,11 @@ mod tests {
         validate_request_placeholders,
     };
     use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn path_prefix_matching_is_boundary_aware() {
@@ -794,8 +800,10 @@ mod tests {
         );
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn resolve_config_text_uses_inline_yaml_and_path_and_base64() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         let inline = "listen: 127.0.0.1:8080\nprivate_key: /tmp/id_rsa\nroutes: []\n";
         unsafe {
             std::env::set_var("VAULTICK_CONFIG", inline);
@@ -823,6 +831,7 @@ mod tests {
 
     #[test]
     fn parse_config_headers_env_accepts_json_object() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe {
             std::env::set_var(
                 "VAULTICK_CONFIG_HEADERS",
@@ -839,6 +848,7 @@ mod tests {
 
     #[test]
     fn parse_config_headers_env_rejects_invalid_json() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
         unsafe {
             std::env::set_var("VAULTICK_CONFIG_HEADERS", "[1,2,3]");
         }

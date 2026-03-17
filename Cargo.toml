@@ -1,5 +1,11 @@
 [workspace]
-members = ["vaultick", "vaultick-request", "vaultick-bin", "vaultick-proxy"]
+members = [
+    "vaultick",
+    "vaultick-request",
+    "vaultick-bin",
+    "vaultick-proxy",
+    "vaultick-mcp",
+]
 resolver = "2"
 
 [workspace.package]

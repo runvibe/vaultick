@@ -1,8 +1,9 @@
 # vaultick
 
-`vaultick` is a secret-management product for operators and platform teams that
-need to store secrets locally, use them in CLI workflows, and forward them
-safely through HTTP services without turning the terminal into a secret dump.
+`vaultick` is a secret-management product for operators, platform teams and
+tooling agents that need to store secrets safely, use them in CLI workflows and
+forward them through HTTP services without turning terminals, prompts or logs
+into a secret dump.
 
 The two primary user-facing pieces are:
 
@@ -10,6 +11,10 @@ The two primary user-facing pieces are:
   outbound HTTP requests
 - `vaultick-proxy`: the reverse proxy service for route-based forwarding with
   secret injection and streamed redaction
+
+`vaultick` is not only about local storage. The local database is the control
+plane for secret ownership and encryption, while `vaultick-proxy` extends that
+model to service and network workflows.
 
 At the center of the project is one rule:
 
@@ -36,6 +41,39 @@ At the center of the project is one rule:
 - making HTTP requests with internal `$SECRET` substitution
 - exposing a reverse proxy that injects secrets into upstream requests
 - redacting secrets if they appear in child process output or upstream responses
+
+One especially strong use case is modern development with LLM-powered tooling.
+
+Today, development agents and coding copilots often need access to:
+
+- API keys
+- GitHub tokens
+- cloud credentials
+- internal service endpoints
+- deployment and automation secrets
+
+Without a layer like `vaultick`, those values tend to become fragile because
+they get pushed into:
+
+- local shell environments
+- `.env` files spread across projects
+- copied prompt context
+- ad-hoc scripts and helper commands
+- tool logs and command output
+
+`vaultick` improves that model by letting LLM-driven workflows use secrets
+through controlled interfaces instead of raw value handling:
+
+- `vaultick exec` lets an agent run a CLI command with secrets injected only for
+  that process
+- `vaultick request` lets an agent call an HTTP API with secret substitution and
+  redacted output
+- `vaultick-proxy` lets teams expose a service boundary that injects secrets and
+  redacts responses before they reach the caller
+
+That makes `vaultick` a good fit for secure developer tooling, AI agents,
+automation pipelines and service integrations that need access to sensitive
+systems without normalizing plaintext secret handling.
 
 In practice:
 

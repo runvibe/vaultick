@@ -14,7 +14,7 @@ use crate::models::StartupOverrides;
 #[command(about = "Config-driven reverse proxy for vaultick-backed secret forwarding")]
 struct Cli {
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     db: Option<PathBuf>,
     #[arg(long, value_name = "WORKSPACE")]
@@ -41,7 +41,8 @@ async fn run() -> Result<(), BoxError> {
         workspace: cli.workspace,
         private_key: cli.private_key,
         listen: cli.listen,
-    })?;
+    })
+    .await?;
     let app_state = services::build_state(&settings)?;
     let app = routes::router(app_state);
 

@@ -44,7 +44,7 @@ pub struct ForwardConfig {
 
 #[derive(Debug, Clone)]
 pub struct StartupOverrides {
-    pub config_path: PathBuf,
+    pub config_path: Option<PathBuf>,
     pub db: Option<PathBuf>,
     pub workspace: Option<String>,
     pub private_key: Option<PathBuf>,

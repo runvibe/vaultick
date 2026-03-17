@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use axum::http::header::{
     CONNECTION, CONTENT_LENGTH, HeaderMap, TE, TRAILER, TRANSFER_ENCODING, UPGRADE,
 };
 use axum::http::{Method, Request, Response, StatusCode, Uri};
+use base64::Engine;
 use vaultick::Vaultick;
 use vaultick_request::{
     AsyncClient, BoxError, RequestBody, RequestSpec, RequestTemplateIndex, ResolvedRequest, Url,
@@ -26,10 +27,12 @@ const DEFAULT_DB_DIRECTORY: &str = "databases";
 const DEFAULT_DB_FILENAME: &str = "database.db";
 const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
 const VAULTICK_WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
+const VAULTICK_CONFIG_ENV_VAR: &str = "VAULTICK_CONFIG";
+const VAULTICK_CONFIG_HEADERS_ENV_VAR: &str = "VAULTICK_CONFIG_HEADERS";
 
-pub fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, BoxError> {
-    let config_text = fs::read_to_string(&overrides.config_path)?;
-    let file_config: ProxyConfigFile = serde_yaml::from_str(&config_text)?;
+pub async fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, BoxError> {
+    let config_text = resolve_config_text(overrides.config_path.as_deref()).await?;
+    let file_config = parse_config_text(&config_text)?;
 
     let db_path = if let Some(path) = overrides.db {
         path
@@ -95,6 +98,88 @@ pub fn build_state(settings: &ResolvedSettings) -> Result<SharedAppState, BoxErr
         client: AsyncClient::builder().build()?,
         routes: compiled_routes,
     }))
+}
+
+async fn resolve_config_text(cli_config_path: Option<&Path>) -> Result<String, BoxError> {
+    if let Some(path) = cli_config_path {
+        return fs::read_to_string(path).map_err(Into::into);
+    }
+
+    let raw_config = std::env::var(VAULTICK_CONFIG_ENV_VAR).map_err(|_| {
+        io::Error::other("missing proxy config. Pass --config <path> or define VAULTICK_CONFIG")
+    })?;
+
+    if parse_config_text(&raw_config).is_ok() {
+        return Ok(raw_config);
+    }
+
+    if is_config_url(&raw_config) {
+        return fetch_remote_config(&raw_config).await;
+    }
+
+    let config_path = PathBuf::from(&raw_config);
+    if config_path.is_file() {
+        return fs::read_to_string(&config_path).map_err(Into::into);
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw_config.as_bytes())
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to resolve VAULTICK_CONFIG as inline config, URL, path, or base64: {err}"
+            ))
+        })?;
+    let decoded_text = String::from_utf8(decoded).map_err(|err| {
+        io::Error::other(format!("VAULTICK_CONFIG base64 was not valid UTF-8: {err}"))
+    })?;
+
+    if parse_config_text(&decoded_text).is_ok() {
+        return Ok(decoded_text);
+    }
+
+    Err(io::Error::other(
+        "VAULTICK_CONFIG base64 decoded successfully but did not contain valid JSON or YAML config",
+    )
+    .into())
+}
+
+fn parse_config_text(input: &str) -> Result<ProxyConfigFile, BoxError> {
+    if let Ok(config) = serde_json::from_str::<ProxyConfigFile>(input) {
+        return Ok(config);
+    }
+
+    Ok(serde_yaml::from_str::<ProxyConfigFile>(input)?)
+}
+
+fn is_config_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+async fn fetch_remote_config(url: &str) -> Result<String, BoxError> {
+    let client = reqwest::Client::builder().build()?;
+    let mut request = client.get(url);
+
+    for (name, value) in parse_config_headers_env()? {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await?;
+    let response = response.error_for_status()?;
+    Ok(response.text().await?)
+}
+
+fn parse_config_headers_env() -> Result<Vec<(String, String)>, BoxError> {
+    let Ok(raw_headers) = std::env::var(VAULTICK_CONFIG_HEADERS_ENV_VAR) else {
+        return Ok(Vec::new());
+    };
+
+    let headers = serde_json::from_str::<HashMap<String, String>>(&raw_headers).map_err(|err| {
+        io::Error::other(format!(
+            "invalid {VAULTICK_CONFIG_HEADERS_ENV_VAR}; expected a JSON object of string headers: {err}"
+        ))
+    })?;
+
+    Ok(headers.into_iter().collect())
 }
 
 pub async fn handle_proxy_request(state: SharedAppState, request: Request<Body>) -> Response<Body> {
@@ -636,11 +721,17 @@ fn plain_response(status: StatusCode, message: &str) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::env::remove_var;
+    use std::fs;
+
+    use base64::Engine;
 
     use super::{
-        RequestContext, build_upstream_url, normalize_path_prefix, path_matches_prefix,
-        render_request_template, validate_request_placeholders,
+        RequestContext, build_upstream_url, normalize_path_prefix, parse_config_headers_env,
+        parse_config_text, path_matches_prefix, render_request_template, resolve_config_text,
+        validate_request_placeholders,
     };
+    use tempfile::tempdir;
 
     #[test]
     fn path_prefix_matching_is_boundary_aware() {
@@ -687,5 +778,74 @@ mod tests {
     fn upstream_url_building_preserves_base_path() {
         let url = build_upstream_url("https://example.com/api", "/v1/items", Some("x=1")).unwrap();
         assert_eq!(url.as_str(), "https://example.com/api/v1/items?x=1");
+    }
+
+    #[test]
+    fn parse_config_text_supports_json_and_yaml() {
+        assert!(
+            parse_config_text(
+                r#"{"listen":"127.0.0.1:8080","private_key":"/tmp/id_rsa","routes":[]}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_config_text("listen: 127.0.0.1:8080\nprivate_key: /tmp/id_rsa\nroutes: []\n")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_config_text_uses_inline_yaml_and_path_and_base64() {
+        let inline = "listen: 127.0.0.1:8080\nprivate_key: /tmp/id_rsa\nroutes: []\n";
+        unsafe {
+            std::env::set_var("VAULTICK_CONFIG", inline);
+        }
+        assert_eq!(resolve_config_text(None).await.unwrap(), inline);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, inline).unwrap();
+        unsafe {
+            std::env::set_var("VAULTICK_CONFIG", path.to_string_lossy().to_string());
+        }
+        assert_eq!(resolve_config_text(None).await.unwrap(), inline);
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(inline);
+        unsafe {
+            std::env::set_var("VAULTICK_CONFIG", encoded);
+        }
+        assert_eq!(resolve_config_text(None).await.unwrap(), inline);
+
+        unsafe {
+            remove_var("VAULTICK_CONFIG");
+        }
+    }
+
+    #[test]
+    fn parse_config_headers_env_accepts_json_object() {
+        unsafe {
+            std::env::set_var(
+                "VAULTICK_CONFIG_HEADERS",
+                r#"{"Authorization":"Bearer token","X-Test":"1"}"#,
+            );
+        }
+        let headers = parse_config_headers_env().unwrap();
+        assert!(headers.contains(&("Authorization".to_string(), "Bearer token".to_string())));
+        assert!(headers.contains(&("X-Test".to_string(), "1".to_string())));
+        unsafe {
+            remove_var("VAULTICK_CONFIG_HEADERS");
+        }
+    }
+
+    #[test]
+    fn parse_config_headers_env_rejects_invalid_json() {
+        unsafe {
+            std::env::set_var("VAULTICK_CONFIG_HEADERS", "[1,2,3]");
+        }
+        let err = parse_config_headers_env().unwrap_err().to_string();
+        assert!(err.contains("expected a JSON object"));
+        unsafe {
+            remove_var("VAULTICK_CONFIG_HEADERS");
+        }
     }
 }

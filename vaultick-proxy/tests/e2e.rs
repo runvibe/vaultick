@@ -2,6 +2,8 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -10,6 +12,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::{Json, Router};
+use base64::Engine;
 use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use rsa::{BigUint, RsaPublicKey};
 use ssh_key::PublicKey as SshPublicKey;
@@ -208,6 +211,212 @@ async fn proxy_fails_fast_when_config_references_unknown_secret() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_starts_from_inline_yaml_env_config() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(upstream_router()).await;
+    let listen_addr = free_addr();
+    let config = format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://{upstream}\n      path: /echo/{{{{request.path_tail}}}}\n      headers:\n        Authorization: \"Bearer $GITHUB_TOKEN\"\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    );
+
+    let _guard = spawn_proxy_from_env(&env, &listen_addr, &config, None).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/github/team"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_starts_from_inline_json_env_config() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(upstream_router()).await;
+    let listen_addr = free_addr();
+    let config = serde_json::json!({
+        "listen": listen_addr,
+        "db": env.db_path,
+        "workspace": "default",
+        "private_key": env.private_key_path,
+        "routes": [{
+            "match": { "path_prefix": "/github" },
+            "forward": {
+                "base_url": format!("http://{upstream_addr}"),
+                "path": "/echo/{{request.path_tail}}",
+                "headers": { "Authorization": "Bearer $GITHUB_TOKEN" }
+            }
+        }]
+    })
+    .to_string();
+
+    let _guard = spawn_proxy_from_env(&env, &listen_addr, &config, None).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/github/team"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_starts_from_env_path_config() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(upstream_router()).await;
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://{upstream}\n      path: /echo/{{{{request.path_tail}}}}\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    ));
+
+    let _guard =
+        spawn_proxy_from_env(&env, &listen_addr, config_path.to_str().unwrap(), None).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/github/team"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_starts_from_env_base64_config() {
+    let env = TestEnv::new();
+    let upstream_addr = spawn_upstream(upstream_router()).await;
+    let listen_addr = free_addr();
+    let config = format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://{upstream}\n      path: /echo/{{{{request.path_tail}}}}\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+        upstream = upstream_addr,
+    );
+    let encoded = base64::engine::general_purpose::STANDARD.encode(config);
+
+    let _guard = spawn_proxy_from_env(&env, &listen_addr, &encoded, None).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/github/team"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_starts_from_env_url_with_headers() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = remote_listener.local_addr().unwrap();
+    let saw_auth_header = Arc::new(AtomicBool::new(false));
+    let config_yaml = format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes:\n  - match:\n      path_prefix: /github\n    forward:\n      base_url: http://127.0.0.1:1\n      path: /echo/{{{{request.path_tail}}}}\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    );
+
+    let auth_probe = Arc::clone(&saw_auth_header);
+    tokio::spawn(async move {
+        axum::serve(
+            remote_listener,
+            Router::new().route(
+                "/config",
+                get(move |headers: axum::http::HeaderMap| {
+                    let config_yaml = config_yaml.clone();
+                    let auth_probe = Arc::clone(&auth_probe);
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        if auth == "Bearer config-token" {
+                            auth_probe.store(true, Ordering::SeqCst);
+                        }
+                        (StatusCode::OK, config_yaml)
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+
+    wait_for_http_url(&format!("http://{remote_addr}/config")).await;
+
+    let _guard = spawn_proxy_from_env(
+        &env,
+        &listen_addr,
+        &format!("http://{remote_addr}/config"),
+        Some(r#"{"Authorization":"Bearer config-token"}"#),
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/missing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(saw_auth_header.load(Ordering::SeqCst));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_config_overrides_vaultick_config_env() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let cli_listen = free_addr();
+    let cli_config = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes: []\n",
+        listen = cli_listen,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    ));
+    let env_config = format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nroutes: []\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    );
+
+    let _guard = spawn_proxy_with_cli_and_env(&env, &cli_listen, &cli_config, &env_config).await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{cli_listen}/missing"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let env_port_still_closed = reqwest::Client::new()
+        .get(format!("http://{listen_addr}/missing"))
+        .send()
+        .await;
+    assert!(env_port_still_closed.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_fails_when_no_cli_config_or_vaultick_config_exist() {
+    let env = TestEnv::new();
+    let output = Command::new(binary())
+        .env("HOME", &env.home)
+        .env_remove("VAULTICK_CONFIG")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Pass --config <path> or define VAULTICK_CONFIG")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_returns_404_when_no_route_matches() {
     let env = TestEnv::new();
     let listen_addr = free_addr();
@@ -324,8 +533,43 @@ async fn spawn_proxy_process(config_path: &Path, listen_addr: &str) -> ChildGuar
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    wait_for_proxy(listen_addr).await;
-    ChildGuard { child }
+    wait_for_proxy(listen_addr, child).await
+}
+
+async fn spawn_proxy_from_env(
+    env: &TestEnv,
+    listen_addr: &str,
+    config_value: &str,
+    config_headers: Option<&str>,
+) -> ChildGuard {
+    let mut command = Command::new(binary());
+    command
+        .env("HOME", &env.home)
+        .env("VAULTICK_CONFIG", config_value)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(headers) = config_headers {
+        command.env("VAULTICK_CONFIG_HEADERS", headers);
+    }
+    let child = command.spawn().unwrap();
+    wait_for_proxy(listen_addr, child).await
+}
+
+async fn spawn_proxy_with_cli_and_env(
+    env: &TestEnv,
+    listen_addr: &str,
+    config_path: &Path,
+    env_config: &str,
+) -> ChildGuard {
+    let child = Command::new(binary())
+        .args(["--config", config_path.to_str().unwrap()])
+        .env("HOME", &env.home)
+        .env("VAULTICK_CONFIG", env_config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_proxy(listen_addr, child).await
 }
 
 fn upstream_router() -> Router {
@@ -392,18 +636,43 @@ fn timeout_router() -> Router {
     )
 }
 
-async fn wait_for_proxy(listen_addr: &str) {
+async fn wait_for_proxy(listen_addr: &str, mut child: Child) -> ChildGuard {
     let client = reqwest::Client::new();
     let url = format!("http://{listen_addr}/__health");
 
     for _ in 0..50 {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "proxy exited early with status {status}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
         match client.get(&url).send().await {
+            Ok(_) => return ChildGuard { child },
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+
+    let output = child.wait_with_output().unwrap();
+    panic!(
+        "proxy did not start listening on {listen_addr}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn wait_for_http_url(url: &str) {
+    let client = reqwest::Client::new();
+
+    for _ in 0..50 {
+        match client.get(url).send().await {
             Ok(_) => return,
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     }
 
-    panic!("proxy did not start listening on {listen_addr}");
+    panic!("HTTP endpoint did not start listening on {url}");
 }
 
 fn free_addr() -> String {

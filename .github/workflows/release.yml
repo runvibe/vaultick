@@ -155,11 +155,13 @@ jobs:
           set -euo pipefail
 
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}" -p vaultick
-            cross build --release --target "${{ matrix.target }}" -p vaultick-proxy
+            cross build --release --target "${{ matrix.target }}" \
+              -p vaultick-bin \
+              -p vaultick-proxy
           else
-            cargo build --release --target "${{ matrix.target }}" -p vaultick
-            cargo build --release --target "${{ matrix.target }}" -p vaultick-proxy
+            cargo build --release --target "${{ matrix.target }}" \
+              -p vaultick-bin \
+              -p vaultick-proxy
           fi
 
       - name: Prepare release assets
@@ -205,6 +207,118 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish_downloads_metadata:
+    name: Publish Downloads Metadata
+    needs: [resolve_version, ensure_tag, build_release_binaries]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve_version.outputs.version }}
+      DOWNLOADS_BUCKET: ${{ vars.DOWNLOADS_BUCKET }}
+      DOWNLOADS_PUBLIC_BASE_URL: ${{ vars.DOWNLOADS_PUBLIC_BASE_URL }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Validate downloads configuration
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+
+          required_env_vars=(
+            VERSION
+            DOWNLOADS_BUCKET
+            DOWNLOADS_PUBLIC_BASE_URL
+            AWS_REGION
+            AWS_ACCESS_KEY_ID
+            AWS_SECRET_ACCESS_KEY
+          )
+
+          for var_name in "${required_env_vars[@]}"; do
+            if [ -z "${!var_name:-}" ]; then
+              echo "::error::Missing required release configuration: ${var_name}"
+              exit 1
+            fi
+          done
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="${DOWNLOADS_PUBLIC_BASE_URL%/}"
+          create_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          cat > latest.json <<EOF
+          {
+            "name": "vaultick",
+            "version": "${VERSION}",
+            "create_at": "${create_at}",
+            "links": {
+              "vaultick_linux_amd64": "${base_url}/${VERSION}/files/vaultick-linux-amd64",
+              "vaultick_linux_arm64": "${base_url}/${VERSION}/files/vaultick-linux-arm64",
+              "vaultick_proxy_linux_amd64": "${base_url}/${VERSION}/files/vaultick-proxy-linux-amd64",
+              "vaultick_proxy_linux_arm64": "${base_url}/${VERSION}/files/vaultick-proxy-linux-arm64"
+            }
+          }
+          EOF
+
+          export BASE_URL="${base_url}"
+
+          jq -e '
+            .name == "vaultick" and
+            .version == env.VERSION and
+            (.create_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+            .links == {
+              "vaultick_linux_amd64": (env.BASE_URL + "/" + env.VERSION + "/files/vaultick-linux-amd64"),
+              "vaultick_linux_arm64": (env.BASE_URL + "/" + env.VERSION + "/files/vaultick-linux-arm64"),
+              "vaultick_proxy_linux_amd64": (env.BASE_URL + "/" + env.VERSION + "/files/vaultick-proxy-linux-amd64"),
+              "vaultick_proxy_linux_arm64": (env.BASE_URL + "/" + env.VERSION + "/files/vaultick-proxy-linux-arm64")
+            }
+          ' latest.json >/dev/null
+
+      - name: Upload release assets to downloads bucket
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aws_args=()
+          if [ -n "${AWS_ENDPOINT_URL}" ]; then
+            aws_args+=(--endpoint-url "${AWS_ENDPOINT_URL}")
+          fi
+
+          for asset in \
+            vaultick-linux-amd64 \
+            vaultick-linux-arm64 \
+            vaultick-proxy-linux-amd64 \
+            vaultick-proxy-linux-arm64; do
+            aws "${aws_args[@]}" s3 cp \
+              "release-assets/${asset}" \
+              "s3://${DOWNLOADS_BUCKET}/${VERSION}/files/${asset}" \
+              --only-show-errors
+          done
+
+          aws "${aws_args[@]}" s3 cp \
+            latest.json \
+            "s3://${DOWNLOADS_BUCKET}/latest.json" \
+            --content-type application/json \
+            --only-show-errors
 
   publish_proxy_images:
     name: Publish Proxy Image (${{ matrix.arch }})
@@ -361,8 +475,8 @@ jobs:
             fi
           }
 
-          publish_crate vaultick-lib
+          publish_crate vaultick
           sleep 30
           publish_crate vaultick-request
           sleep 30
-          publish_crate vaultick
+          publish_crate vaultick-bin

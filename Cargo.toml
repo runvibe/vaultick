@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "vaultick",
+    "vaultick-lib",
     "vaultick-request",
-    "vaultick-bin",
+    "vaultick",
     "vaultick-proxy",
     "vaultick-mcp",
 ]

@@ -49,22 +49,32 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(about = "Manage workspaces for grouping secrets and certificates")]
     Workspace(WorkspaceCommand),
+    #[command(about = "Manage RSA certificates used to wrap secrets")]
     Rsa(RsaCommand),
+    #[command(about = "Store, read, list, and delete secrets")]
     Secret(SecretCommand),
+    #[command(about = "Run a process with secrets injected as environment variables")]
     Exec(ExecCommand),
+    #[command(about = "Send HTTP requests with vault-backed secret interpolation")]
     Request(RequestCommand),
 }
 
 #[derive(Subcommand, Debug)]
 enum WorkspaceSubcommand {
+    #[command(about = "Create a new workspace")]
     Create { name: String },
+    #[command(about = "List all workspaces")]
     List,
+    #[command(about = "Show details for a workspace")]
     Get { workspace_ref: String },
+    #[command(about = "Delete a workspace")]
     Delete { workspace_ref: String },
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Manage workspaces for grouping secrets and certificates")]
 struct WorkspaceCommand {
     #[command(subcommand)]
     command: WorkspaceSubcommand,
@@ -72,6 +82,7 @@ struct WorkspaceCommand {
 
 #[derive(Subcommand, Debug)]
 enum RsaSubcommand {
+    #[command(about = "Add an RSA certificate to the active workspace")]
     Add {
         #[arg(long)]
         label: Option<String>,
@@ -82,13 +93,16 @@ enum RsaSubcommand {
         #[arg(long = "rewrap-from-key", value_name = "PEM_PATH")]
         rewrap_from_key: Option<PathBuf>,
     },
+    #[command(about = "List RSA certificates in the active workspace")]
     List,
+    #[command(about = "Delete an RSA certificate from the active workspace")]
     Delete {
         cert_ref: String,
     },
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Manage RSA certificates used to wrap secrets")]
 struct RsaCommand {
     #[command(subcommand)]
     command: RsaSubcommand,
@@ -96,6 +110,7 @@ struct RsaCommand {
 
 #[derive(Subcommand, Debug)]
 enum SecretSubcommand {
+    #[command(about = "Create or update a secret")]
     Set {
         key: Option<String>,
         value: Option<String>,
@@ -110,27 +125,32 @@ enum SecretSubcommand {
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Option<String>,
     },
+    #[command(about = "Read a secret value")]
     Get {
         key: String,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "List secrets in the active workspace")]
     List {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Delete a secret")]
     Delete {
         key: String,
     },
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Store, read, list, and delete secrets")]
 struct SecretCommand {
     #[command(subcommand)]
     command: SecretSubcommand,
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Run a process with secrets injected as environment variables")]
 struct ExecCommand {
     #[arg(long = "private-key", value_name = "PEM_PATH")]
     private_key: Option<PathBuf>,
@@ -148,6 +168,7 @@ struct ExecCommand {
 }
 
 #[derive(Args, Debug)]
+#[command(about = "Send HTTP requests with vault-backed secret interpolation")]
 struct RequestCommand {
     #[arg(long = "private-key", value_name = "PEM_PATH")]
     private_key: Option<PathBuf>,

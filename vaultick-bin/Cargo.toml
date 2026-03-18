@@ -1,5 +1,5 @@
 [package]
-name = "vaultick"
+name = "vaultick-bin"
 version = "0.1.0"
 edition = "2024"
 description = "CLI for secure secret storage and process injection with vaultick"
@@ -15,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 ssh-key = { version = "0.6.7", features = ["rsa"] }
 serde_json = "1"
 vaultick-request = { version = "0.1.0", path = "../vaultick-request" }
-vaultick = { package = "vaultick-lib", version = "0.1.0", path = "../vaultick" }
+vaultick = { version = "0.1.0", path = "../vaultick-lib" }
 
 [dev-dependencies]
 tempfile = "3"

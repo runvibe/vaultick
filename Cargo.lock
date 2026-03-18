@@ -2313,21 +2313,6 @@ dependencies = [
 name = "vaultick"
 version = "0.1.0"
 dependencies = [
- "clap",
- "dialoguer",
- "rsa",
- "serde",
- "serde_json",
- "ssh-key",
- "tempfile",
- "vaultick-lib",
- "vaultick-request",
-]
-
-[[package]]
-name = "vaultick-lib"
-version = "0.1.0"
-dependencies = [
  "aes-gcm",
  "hex",
  "rand 0.8.5",
@@ -2339,6 +2324,21 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
  "x509-parser",
+]
+
+[[package]]
+name = "vaultick-bin"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dialoguer",
+ "rsa",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "vaultick",
+ "vaultick-request",
 ]
 
 [[package]]
@@ -2360,7 +2360,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
- "vaultick-lib",
+ "vaultick",
  "vaultick-request",
 ]
 
@@ -2383,7 +2383,7 @@ dependencies = [
  "ssh-key",
  "tempfile",
  "tokio",
- "vaultick-lib",
+ "vaultick",
  "vaultick-request",
 ]
 

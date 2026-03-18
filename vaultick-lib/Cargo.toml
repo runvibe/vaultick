@@ -1,5 +1,5 @@
 [package]
-name = "vaultick-lib"
+name = "vaultick"
 version = "0.1.0"
 edition = "2024"
 description = "SQLite-backed secret storage with RSA-wrapped encryption keys"

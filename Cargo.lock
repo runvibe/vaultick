@@ -2311,7 +2311,7 @@ dependencies = [
 
 [[package]]
 name = "vaultick"
-version = "0.1.0"
+version = "0.0.1-alpha.0"
 dependencies = [
  "aes-gcm",
  "hex",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "vaultick-bin"
-version = "0.1.0"
+version = "0.0.1-alpha.0"
 dependencies = [
  "clap",
  "dialoguer",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "vaultick-mcp"
-version = "0.1.0"
+version = "0.0.1-alpha.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -2366,7 +2366,7 @@ dependencies = [
 
 [[package]]
 name = "vaultick-proxy"
-version = "0.1.0"
+version = "0.0.1-alpha.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "vaultick-request"
-version = "0.1.0"
+version = "0.0.1-alpha.0"
 dependencies = [
  "async-stream",
  "axum",

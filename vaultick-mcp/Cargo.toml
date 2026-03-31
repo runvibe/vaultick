@@ -1,35 +1,43 @@
 [package]
 name = "vaultick-mcp"
-version = "0.1.0"
-edition = "2024"
 description = "Local MCP HTTP/SSE server for safe vaultick-backed exec and request tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
-repository.workspace = true
-readme = "../README.md"
-publish = false
 
 [dependencies]
-axum = "0.8"
-clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
-http = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "sync"] }
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "net",
+    "sync",
+] }
 tokio-stream = "0.1"
-uuid = { version = "1", features = ["v4"] }
-vaultick-request = { version = "0.1.0", path = "../vaultick-request" }
-vaultick = { version = "0.1.0", path = "../vaultick-lib" }
+uuid.workspace = true
+vaultick.workspace = true
+vaultick-request.workspace = true
 
 [dev-dependencies]
-async-stream = "0.3"
-axum = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
-rsa = { version = "0.9", features = ["pem"] }
-serde_json = "1"
-ssh-key = { version = "0.6.7", features = ["rsa"] }
-tempfile = "3"
+async-stream.workspace = true
+axum.workspace = true
+reqwest = { workspace = true, features = [
+    "stream",
+    "json",
+] }
+rsa.workspace = true
+serde_json.workspace = true
+ssh-key.workspace = true
+tempfile.workspace = true
 
 [[bin]]
 name = "vaultick-mcp"

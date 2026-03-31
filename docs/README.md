@@ -39,3 +39,4 @@ operator and service guides.
 
 - [vaultick-lib](services/vaultick-lib.md)
 - [vaultick-request](services/vaultick-request.md)
+- [Previa smoke suite](testing/previa.md)

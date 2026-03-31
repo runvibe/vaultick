@@ -114,19 +114,35 @@ jobs:
   build_release_binaries:
     name: Build Release Binaries (${{ matrix.name }})
     needs: [resolve_version, ensure_tag]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-amd64
+            runs_on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            os_slug: linux
             arch: amd64
+            exe_ext: ""
             use_cross: false
+            build_proxy: true
           - name: linux-arm64
+            runs_on: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            os_slug: linux
             arch: arm64
+            exe_ext: ""
             use_cross: true
+            build_proxy: true
+          - name: windows-amd64
+            runs_on: windows-latest
+            target: x86_64-pc-windows-msvc
+            os_slug: windows
+            arch: amd64
+            exe_ext: ".exe"
+            use_cross: false
+            build_proxy: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -155,13 +171,23 @@ jobs:
           set -euo pipefail
 
           if [ "${{ matrix.use_cross }}" = "true" ]; then
-            cross build --release --target "${{ matrix.target }}" \
-              -p vaultick-bin \
-              -p vaultick-proxy
+            if [ "${{ matrix.build_proxy }}" = "true" ]; then
+              cross build --release --target "${{ matrix.target }}" \
+                -p vaultick-bin \
+                -p vaultick-proxy
+            else
+              cross build --release --target "${{ matrix.target }}" \
+                -p vaultick-bin
+            fi
           else
-            cargo build --release --target "${{ matrix.target }}" \
-              -p vaultick-bin \
-              -p vaultick-proxy
+            if [ "${{ matrix.build_proxy }}" = "true" ]; then
+              cargo build --release --target "${{ matrix.target }}" \
+                -p vaultick-bin \
+                -p vaultick-proxy
+            else
+              cargo build --release --target "${{ matrix.target }}" \
+                -p vaultick-bin
+            fi
           fi
 
       - name: Prepare release assets
@@ -171,11 +197,13 @@ jobs:
 
           mkdir -p dist
 
-          cp "target/${{ matrix.target }}/release/vaultick" \
-            "dist/vaultick-linux-${{ matrix.arch }}"
+          cp "target/${{ matrix.target }}/release/vaultick${{ matrix.exe_ext }}" \
+            "dist/vaultick-${{ matrix.os_slug }}-${{ matrix.arch }}${{ matrix.exe_ext }}"
 
-          cp "target/${{ matrix.target }}/release/vaultick-proxy" \
-            "dist/vaultick-proxy-linux-${{ matrix.arch }}"
+          if [ "${{ matrix.build_proxy }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/vaultick-proxy${{ matrix.exe_ext }}" \
+              "dist/vaultick-proxy-${{ matrix.os_slug }}-${{ matrix.arch }}${{ matrix.exe_ext }}"
+          fi
 
       - name: Upload release assets
         uses: actions/upload-artifact@v4

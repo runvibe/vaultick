@@ -21,8 +21,9 @@ It currently:
 - updates shell startup files on Unix-like systems so `~/.vaultick/bin` lands on
   `PATH`
 
-At this stage the installer is Linux-only because the release workflow only
-publishes Linux `vaultick` binaries.
+At this stage the installer is Linux-only. The release workflow also publishes a
+Windows CLI asset on GitHub Releases, but there is not yet a PowerShell
+installer equivalent.
 
 ## What Gets Installed
 
@@ -67,6 +68,7 @@ Current link keys are:
 - `vaultick_proxy_linux_arm64`
 
 The installer currently consumes only the `vaultick_*` CLI entries.
+The manifest remains Linux-only.
 
 ## Docker Images
 
@@ -90,11 +92,27 @@ At a high level, the release workflow:
 1. resolves the workspace version
 2. creates or validates the matching git tag
 3. builds Linux release binaries for `vaultick` and `vaultick-proxy`
-4. creates the GitHub release and uploads the binaries
-5. publishes Linux assets plus `latest.json` and `install.sh` to the downloads
+4. builds a Windows release binary for `vaultick` only
+5. creates the GitHub release and uploads the binaries
+6. publishes Linux assets plus `latest.json` and `install.sh` to the downloads
    bucket
-6. builds and publishes the multi-arch `vaultick-proxy` image
-7. optionally publishes Rust crates when `CARGO_REGISTRY_TOKEN` is configured
+7. builds and publishes the multi-arch `vaultick-proxy` image
+8. optionally publishes Rust crates when `CARGO_REGISTRY_TOKEN` is configured
+
+## Platform Coverage
+
+Current published assets are:
+
+- Linux:
+  - `vaultick`
+  - `vaultick-proxy`
+  - `amd64` and `arm64`
+- Windows:
+  - `vaultick.exe`
+  - `amd64`
+
+Only Linux artifacts are uploaded to `downloads.vaultick.dev` and referenced by
+`latest.json`.
 
 ## Uninstall
 

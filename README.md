@@ -84,7 +84,16 @@ In practice:
 
 ## Install
 
-Build the workspace:
+Install the CLI with the public installer:
+
+```bash
+curl -fsSL https://downloads.vaultick.dev/install.sh | sh
+```
+
+Today this installer targets the published Linux `vaultick` binary and configures
+`VAULTICK_HOME="$HOME/.vaultick"`.
+
+Build the workspace from source:
 
 ```bash
 cargo build --release --workspace
@@ -401,12 +410,13 @@ inject it into that workflow.
 
 ## Detailed documentation
 
-The detailed docs live in [docs/README.md](/home/assis/projects/cloudvibe/valtick/docs/README.md).
+The detailed docs live in [docs/README.md](docs/README.md).
 
 ### Main operator and deployment docs
 
 - [vaultick CLI guide](docs/services/vaultick-cli.md)
 - [vaultick-proxy guide](docs/services/vaultick-proxy.md)
+- [Release and install](docs/release-install.md)
 - [Secrets reference](docs/resources/secrets.md)
 - [RSA reference](docs/resources/rsa.md)
 - [HTTP requests and proxy forwarding](docs/resources/http.md)

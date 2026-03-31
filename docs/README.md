@@ -11,6 +11,7 @@ The main reading path is centered on:
 
 - [vaultick CLI guide](services/vaultick-cli.md)
 - [vaultick-proxy guide](services/vaultick-proxy.md)
+- [Release and install](release-install.md)
 - [Secrets reference](resources/secrets.md)
 - [RSA certificates reference](resources/rsa.md)
 - [HTTP requests and proxy forwarding](resources/http.md)

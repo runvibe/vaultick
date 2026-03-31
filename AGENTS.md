@@ -13,7 +13,8 @@
   migrations/, and avoid inline schema drift.
 - **Processes**: discuss changes via PROJECT.md conventions, open pull requests
   with review context, and keep agents.md current when workflows shift.
+- **Release assets**: keep `install.sh`, `latest.json`, GitHub Release asset
+  names, and docs aligned whenever the release workflow changes.
 - **Release build & push**: after finishing any change run
   `cargo build --release`; if the release build succeeds, commit the changes and
   push to the remote.
-

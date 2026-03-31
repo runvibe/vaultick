@@ -257,6 +257,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ vars.AWS_REGION }}
 
+      - name: Validate installer script
+        shell: bash
+        run: |
+          set -euo pipefail
+          sh -n install.sh
+
       - name: Generate latest.json
         shell: bash
         run: |
@@ -318,6 +324,12 @@ jobs:
             latest.json \
             "s3://${DOWNLOADS_BUCKET}/latest.json" \
             --content-type application/json \
+            --only-show-errors
+
+          aws "${aws_args[@]}" s3 cp \
+            install.sh \
+            "s3://${DOWNLOADS_BUCKET}/install.sh" \
+            --content-type text/x-shellscript \
             --only-show-errors
 
   publish_proxy_images:

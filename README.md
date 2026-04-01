@@ -87,7 +87,7 @@ In practice:
 Install the CLI with the public installer:
 
 ```bash
-curl -fsSL https://downloads.vaultick.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cloudvibedev/vaultick/main/install.sh | sh
 ```
 
 Today this installer targets the published Linux `vaultick` binary and configures
@@ -97,8 +97,10 @@ On Windows, the release workflow publishes `vaultick.exe` on GitHub Releases,
 but there is not yet a PowerShell installer.
 
 The manual release workflow supports `linux`, `mac`, `windows`, or `all`.
-Linux publishes release assets, Docker image, downloads metadata, and crates;
+Linux publishes release assets, repository metadata, Docker image, and crates;
 macOS and Windows publish release assets only.
+
+The repo-hosted installer metadata is refreshed by Linux or `all` releases.
 
 Build the workspace from source:
 

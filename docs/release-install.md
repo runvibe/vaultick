@@ -8,12 +8,13 @@ how the public installer works from the operator point of view.
 The public installer is:
 
 ```bash
-curl -fsSL https://downloads.vaultick.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cloudvibedev/vaultick/main/install.sh | sh
 ```
 
 It currently:
 
-- downloads `latest.json` from `https://downloads.vaultick.dev/latest.json`
+- downloads `release-metadata.json` from
+  `https://raw.githubusercontent.com/cloudvibedev/vaultick/main/release-metadata.json`
 - resolves the latest published version and Linux binary links
 - detects `amd64` or `arm64`
 - installs the `vaultick` CLI under the default user-scoped Vaultick home
@@ -47,18 +48,18 @@ This matches the CLI default database resolution:
 VAULTICK_HOME/databases/database.db
 ```
 
-## `latest.json`
+## `release-metadata.json`
 
-The release workflow publishes a manifest at:
+The release workflow updates a metadata file in the repository at:
 
 ```text
-https://downloads.vaultick.dev/latest.json
+https://raw.githubusercontent.com/cloudvibedev/vaultick/main/release-metadata.json
 ```
 
-That manifest contains:
+That metadata file contains:
 
 - the latest version
-- direct download links for published binaries
+- direct GitHub Release download links for published binaries
 
 Current link keys are:
 
@@ -66,9 +67,14 @@ Current link keys are:
 - `vaultick_linux_arm64`
 - `vaultick_proxy_linux_amd64`
 - `vaultick_proxy_linux_arm64`
+- `vaultick_macos_amd64` when the latest metadata-producing release included
+  macOS assets
+- `vaultick_windows_amd64` when the latest metadata-producing release included
+  Windows assets
 
 The installer currently consumes only the `vaultick_*` CLI entries.
-The manifest remains Linux-only.
+Because the installer is Linux-only, this metadata file is updated only when the
+release scope includes Linux.
 
 ## Docker Images
 
@@ -94,8 +100,7 @@ At a high level, the release workflow:
 3. creates or validates the matching git tag
 4. builds the binaries required by that scope
 5. creates the GitHub release and uploads the selected assets
-6. when Linux is included, publishes Linux assets plus `latest.json` and
-   `install.sh` to the downloads bucket
+6. when Linux is included, updates `release-metadata.json` on `main`
 7. when Linux is included, builds and publishes the multi-arch
    `vaultick-proxy` image
 8. when Linux is included, optionally publishes Rust crates when
@@ -103,13 +108,17 @@ At a high level, the release workflow:
 
 The manual workflow supports four scopes:
 
-- `linux`: GitHub Release assets for Linux plus Docker, crates.io, and bucket
-  publishing
+- `linux`: GitHub Release assets for Linux plus repository metadata, Docker, and
+  crates.io publishing
 - `mac`: GitHub Release asset for macOS only
 - `windows`: GitHub Release asset for Windows only
 - `all`: Linux full publishing plus macOS and Windows release assets
 
 When the workflow runs from a pushed `v*` tag, it behaves as `all`.
+
+If the current workspace version does not have a published GitHub Release yet,
+the committed metadata may exist before the release assets do. The next Linux or
+`all` release is what makes the metadata resolvable for the installer.
 
 ## Platform Coverage
 
@@ -126,8 +135,8 @@ Current published assets are:
   - `vaultick.exe`
   - `amd64`
 
-Only Linux artifacts are uploaded to `downloads.vaultick.dev` and referenced by
-`latest.json`.
+`release-metadata.json` tracks the latest Linux-installable release and points
+at GitHub Release assets.
 
 ## Uninstall
 

@@ -96,6 +96,10 @@ Today this installer targets the published Linux `vaultick` binary and configure
 On Windows, the release workflow publishes `vaultick.exe` on GitHub Releases,
 but there is not yet a PowerShell installer.
 
+The manual release workflow supports `linux`, `mac`, `windows`, or `all`.
+Linux publishes release assets, Docker image, downloads metadata, and crates;
+macOS and Windows publish release assets only.
+
 Build the workspace from source:
 
 ```bash

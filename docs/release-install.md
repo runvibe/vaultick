@@ -21,9 +21,9 @@ It currently:
 - updates shell startup files on Unix-like systems so `~/.vaultick/bin` lands on
   `PATH`
 
-At this stage the installer is Linux-only. The release workflow also publishes a
-Windows CLI asset on GitHub Releases, but there is not yet a PowerShell
-installer equivalent.
+At this stage the installer is Linux-only. The release workflow can also publish
+macOS and Windows CLI assets on GitHub Releases, but there is not yet a
+PowerShell installer and the public installer does not target macOS.
 
 ## What Gets Installed
 
@@ -90,14 +90,26 @@ These tags are published:
 At a high level, the release workflow:
 
 1. resolves the workspace version
-2. creates or validates the matching git tag
-3. builds Linux release binaries for `vaultick` and `vaultick-proxy`
-4. builds a Windows release binary for `vaultick` only
-5. creates the GitHub release and uploads the binaries
-6. publishes Linux assets plus `latest.json` and `install.sh` to the downloads
-   bucket
-7. builds and publishes the multi-arch `vaultick-proxy` image
-8. optionally publishes Rust crates when `CARGO_REGISTRY_TOKEN` is configured
+2. resolves the selected release scope
+3. creates or validates the matching git tag
+4. builds the binaries required by that scope
+5. creates the GitHub release and uploads the selected assets
+6. when Linux is included, publishes Linux assets plus `latest.json` and
+   `install.sh` to the downloads bucket
+7. when Linux is included, builds and publishes the multi-arch
+   `vaultick-proxy` image
+8. when Linux is included, optionally publishes Rust crates when
+   `CARGO_REGISTRY_TOKEN` is configured
+
+The manual workflow supports four scopes:
+
+- `linux`: GitHub Release assets for Linux plus Docker, crates.io, and bucket
+  publishing
+- `mac`: GitHub Release asset for macOS only
+- `windows`: GitHub Release asset for Windows only
+- `all`: Linux full publishing plus macOS and Windows release assets
+
+When the workflow runs from a pushed `v*` tag, it behaves as `all`.
 
 ## Platform Coverage
 
@@ -107,6 +119,9 @@ Current published assets are:
   - `vaultick`
   - `vaultick-proxy`
   - `amd64` and `arm64`
+- macOS:
+  - `vaultick`
+  - `amd64`
 - Windows:
   - `vaultick.exe`
   - `amd64`

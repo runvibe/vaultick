@@ -1,10 +1,21 @@
-name: Release
+name: Release Binaries, Docker Images and Crates
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_scope:
+        description: "Release scope to publish: Linux full, macOS release, Windows release, or all platforms"
+        required: true
+        default: all
+        type: choice
+        options:
+          - linux
+          - mac
+          - windows
+          - all
 
 permissions:
   contents: write
@@ -73,6 +84,88 @@ jobs:
 
           echo "tag=${expected_tag}" >> "${GITHUB_OUTPUT}"
 
+  resolve_scope:
+    name: Resolve Release Scope
+    needs: resolve_version
+    runs-on: ubuntu-latest
+    outputs:
+      release_scope: ${{ steps.scope.outputs.release_scope }}
+      build_matrix: ${{ steps.scope.outputs.build_matrix }}
+      publish_docker: ${{ steps.scope.outputs.publish_docker }}
+      publish_crates: ${{ steps.scope.outputs.publish_crates }}
+      publish_bucket: ${{ steps.scope.outputs.publish_bucket }}
+      publish_github_release: ${{ steps.scope.outputs.publish_github_release }}
+    steps:
+      - name: Normalize release scope
+        id: scope
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            scope="${{ inputs.release_scope }}"
+          else
+            scope="all"
+          fi
+
+          linux_matrix='[
+            {"name":"linux-amd64","artifact_name":"release-linux-amd64","runs_on":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","os_slug":"linux","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":true},
+            {"name":"linux-arm64","artifact_name":"release-linux-arm64","runs_on":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","os_slug":"linux","arch_slug":"arm64","exe_ext":"","use_cross":true,"build_proxy":true}
+          ]'
+          mac_matrix='[
+            {"name":"macos-amd64","artifact_name":"release-macos-amd64","runs_on":"macos-latest","target":"x86_64-apple-darwin","os_slug":"macos","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":false}
+          ]'
+          windows_matrix='[
+            {"name":"windows-amd64","artifact_name":"release-windows-amd64","runs_on":"windows-latest","target":"x86_64-pc-windows-msvc","os_slug":"windows","arch_slug":"amd64","exe_ext":".exe","use_cross":false,"build_proxy":false}
+          ]'
+
+          case "${scope}" in
+            linux)
+              publish_docker=true
+              publish_crates=true
+              publish_bucket=true
+              build_matrix="${linux_matrix}"
+              ;;
+            mac)
+              publish_docker=false
+              publish_crates=false
+              publish_bucket=false
+              build_matrix="${mac_matrix}"
+              ;;
+            windows)
+              publish_docker=false
+              publish_crates=false
+              publish_bucket=false
+              build_matrix="${windows_matrix}"
+              ;;
+            all)
+              publish_docker=true
+              publish_crates=true
+              publish_bucket=true
+              build_matrix='[
+                {"name":"linux-amd64","artifact_name":"release-linux-amd64","runs_on":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","os_slug":"linux","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":true},
+                {"name":"linux-arm64","artifact_name":"release-linux-arm64","runs_on":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","os_slug":"linux","arch_slug":"arm64","exe_ext":"","use_cross":true,"build_proxy":true},
+                {"name":"macos-amd64","artifact_name":"release-macos-amd64","runs_on":"macos-latest","target":"x86_64-apple-darwin","os_slug":"macos","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":false},
+                {"name":"windows-amd64","artifact_name":"release-windows-amd64","runs_on":"windows-latest","target":"x86_64-pc-windows-msvc","os_slug":"windows","arch_slug":"amd64","exe_ext":".exe","use_cross":false,"build_proxy":false}
+              ]'
+              ;;
+            *)
+              echo "::error::Unsupported release scope: ${scope}"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "release_scope=${scope}"
+            echo "build_matrix<<EOF"
+            echo "${build_matrix}"
+            echo "EOF"
+            echo "publish_docker=${publish_docker}"
+            echo "publish_crates=${publish_crates}"
+            echo "publish_bucket=${publish_bucket}"
+            echo "publish_github_release=true"
+          } >> "${GITHUB_OUTPUT}"
+
   ensure_tag:
     name: Ensure Release Tag
     needs: resolve_version
@@ -113,36 +206,12 @@ jobs:
 
   build_release_binaries:
     name: Build Release Binaries (${{ matrix.name }})
-    needs: [resolve_version, ensure_tag]
+    needs: [resolve_version, resolve_scope, ensure_tag]
     runs-on: ${{ matrix.runs_on }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: linux-amd64
-            runs_on: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            os_slug: linux
-            arch: amd64
-            exe_ext: ""
-            use_cross: false
-            build_proxy: true
-          - name: linux-arm64
-            runs_on: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            os_slug: linux
-            arch: arm64
-            exe_ext: ""
-            use_cross: true
-            build_proxy: true
-          - name: windows-amd64
-            runs_on: windows-latest
-            target: x86_64-pc-windows-msvc
-            os_slug: windows
-            arch: amd64
-            exe_ext: ".exe"
-            use_cross: false
-            build_proxy: false
+        include: ${{ fromJSON(needs.resolve_scope.outputs.build_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -165,7 +234,7 @@ jobs:
         shell: bash
         run: cargo install cross --locked
 
-      - name: Build binaries
+      - name: Build selected binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -198,23 +267,24 @@ jobs:
           mkdir -p dist
 
           cp "target/${{ matrix.target }}/release/vaultick${{ matrix.exe_ext }}" \
-            "dist/vaultick-${{ matrix.os_slug }}-${{ matrix.arch }}${{ matrix.exe_ext }}"
+            "dist/vaultick-${{ matrix.os_slug }}-${{ matrix.arch_slug }}${{ matrix.exe_ext }}"
 
           if [ "${{ matrix.build_proxy }}" = "true" ]; then
             cp "target/${{ matrix.target }}/release/vaultick-proxy${{ matrix.exe_ext }}" \
-              "dist/vaultick-proxy-${{ matrix.os_slug }}-${{ matrix.arch }}${{ matrix.exe_ext }}"
+              "dist/vaultick-proxy-${{ matrix.os_slug }}-${{ matrix.arch_slug }}${{ matrix.exe_ext }}"
           fi
 
       - name: Upload release assets
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.name }}
+          name: ${{ matrix.artifact_name }}
           path: dist/*
           if-no-files-found: error
 
   github_release:
     name: Publish GitHub Release
-    needs: [resolve_version, ensure_tag, build_release_binaries]
+    if: needs.resolve_scope.outputs.publish_github_release == 'true'
+    needs: [resolve_version, resolve_scope, ensure_tag, build_release_binaries]
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets
@@ -238,7 +308,8 @@ jobs:
 
   publish_downloads_metadata:
     name: Publish Downloads Metadata
-    needs: [resolve_version, ensure_tag, build_release_binaries]
+    if: needs.resolve_scope.outputs.publish_bucket == 'true'
+    needs: [resolve_version, resolve_scope, ensure_tag, build_release_binaries]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.resolve_version.outputs.version }}
@@ -247,10 +318,10 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL }}
     steps:
-      - name: Download release assets
+      - name: Download Linux release assets
         uses: actions/download-artifact@v4
         with:
-          pattern: release-*
+          pattern: release-linux-*
           merge-multiple: true
           path: release-assets
 
@@ -362,7 +433,8 @@ jobs:
 
   publish_proxy_images:
     name: Publish Proxy Image (${{ matrix.arch }})
-    needs: [resolve_version, ensure_tag, build_release_binaries]
+    if: needs.resolve_scope.outputs.publish_docker == 'true'
+    needs: [resolve_version, resolve_scope, ensure_tag, build_release_binaries]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -433,7 +505,8 @@ jobs:
 
   publish_proxy_manifest:
     name: Publish Proxy Image Manifest
-    needs: [resolve_version, publish_proxy_images]
+    if: needs.resolve_scope.outputs.publish_docker == 'true'
+    needs: [resolve_version, resolve_scope, publish_proxy_images]
     runs-on: ubuntu-latest
     steps:
       - name: Login to GHCR
@@ -461,7 +534,8 @@ jobs:
 
   publish_crates:
     name: Publish Crates.io Packages
-    needs: [resolve_version, ensure_tag]
+    if: needs.resolve_scope.outputs.publish_crates == 'true'
+    needs: [resolve_version, resolve_scope, ensure_tag]
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

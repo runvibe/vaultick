@@ -9,8 +9,8 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use rsa::BigUint;
-use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use rsa::RsaPublicKey;
+use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use serde_json::{Value, json};
 use ssh_key::PublicKey as SshPublicKey;
 use tempfile::TempDir;
@@ -226,10 +226,12 @@ async fn mcp_exec_respects_allowlist() {
         .unwrap();
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["result"]["isError"], true);
-    assert!(body["result"]["structuredContent"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("not allowed"));
+    assert!(
+        body["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not allowed")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -263,7 +265,9 @@ async fn mcp_request_redacts_response_body() {
         .unwrap();
 
     let body: Value = response.json().await.unwrap();
-    let text = body["result"]["structuredContent"]["body"].as_str().unwrap();
+    let text = body["result"]["structuredContent"]["body"]
+        .as_str()
+        .unwrap();
     assert!(text.contains("[REDACTED]"));
     assert!(!text.contains("super-secret-token"));
 }
@@ -301,7 +305,12 @@ async fn mcp_request_streams_sse_with_redacted_chunks() {
         .unwrap();
 
     assert_eq!(
-        response.headers().get("content-type").unwrap().to_str().unwrap(),
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "text/event-stream"
     );
     let body = response.text().await.unwrap();
@@ -496,5 +505,8 @@ fn ssh_public_key_to_pem(openssh: &str) -> String {
         BigUint::from_bytes_be(rsa_public.e.as_bytes()),
     )
     .unwrap();
-    public_key.to_public_key_pem(LineEnding::LF).unwrap().to_string()
+    public_key
+        .to_public_key_pem(LineEnding::LF)
+        .unwrap()
+        .to_string()
 }

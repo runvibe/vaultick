@@ -567,6 +567,30 @@ impl Vaultick {
             .map_err(VaultickError::from)
     }
 
+    pub fn list_secrets_paginated(
+        &self,
+        workspace_ref: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SecretMetadata>> {
+        let conn = self.conn.borrow();
+        let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, key, created_at, updated_at
+             FROM secrets
+             WHERE workspace_id = ?1
+             ORDER BY key ASC
+             LIMIT ?2
+             OFFSET ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![workspace.id, limit as i64, offset as i64],
+            secret_metadata_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(VaultickError::from)
+    }
+
     pub fn delete_secret(&self, workspace_ref: &str, key: &str) -> Result<()> {
         let key = normalize_secret_key(key)?;
         let mut conn = self.conn.borrow_mut();
@@ -1320,6 +1344,42 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(fetched.key, "API-KEY");
         assert_eq!(fetched.created_at, created.created_at);
         assert_eq!(fetched.updated_at, created.updated_at);
+    }
+
+    #[test]
+    fn list_secrets_paginated_applies_limit_and_offset() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+
+        for index in 0..12 {
+            store
+                .set_secret(
+                    "team-a",
+                    &format!("SECRET_{index:02}"),
+                    &format!("value-{index}"),
+                    false,
+                )
+                .unwrap();
+        }
+
+        let first_page = store.list_secrets_paginated("team-a", 5, 0).unwrap();
+        let second_page = store.list_secrets_paginated("team-a", 5, 5).unwrap();
+        let tail_page = store.list_secrets_paginated("team-a", 5, 10).unwrap();
+
+        assert_eq!(first_page.len(), 5);
+        assert_eq!(first_page[0].key, "SECRET_00");
+        assert_eq!(first_page[4].key, "SECRET_04");
+
+        assert_eq!(second_page.len(), 5);
+        assert_eq!(second_page[0].key, "SECRET_05");
+        assert_eq!(second_page[4].key, "SECRET_09");
+
+        assert_eq!(tail_page.len(), 2);
+        assert_eq!(tail_page[0].key, "SECRET_10");
+        assert_eq!(tail_page[1].key, "SECRET_11");
     }
 
     #[test]

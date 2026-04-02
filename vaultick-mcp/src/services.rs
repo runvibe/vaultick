@@ -18,10 +18,10 @@ use vaultick_request::{AsyncClient, BoxError};
 
 use crate::models::{
     AppState, DEFAULT_DB_DIRECTORY, DEFAULT_DB_FILENAME, DEFAULT_LISTEN_ADDR,
-    DEFAULT_PROTOCOL_VERSION, DEFAULT_WORKSPACE_NAME, JsonRpcError,
-    JsonRpcRequest, JsonRpcResponse, KEEPALIVE_INTERVAL, LogLevel, LoggingNotificationParams,
-    MCP_PROTOCOL_HEADER, MCP_SESSION_HEADER, McpConfigFile, ResolvedSettings,
-    SessionState, SharedAppState, StartupOverrides, ToolCallParams,
+    DEFAULT_PROTOCOL_VERSION, DEFAULT_WORKSPACE_NAME, JsonRpcError, JsonRpcRequest,
+    JsonRpcResponse, KEEPALIVE_INTERVAL, LogLevel, LoggingNotificationParams, MCP_PROTOCOL_HEADER,
+    MCP_SESSION_HEADER, McpConfigFile, ResolvedSettings, SessionState, SharedAppState,
+    StartupOverrides, ToolCallParams,
 };
 use crate::runtime::{
     execute_request, parse_exec_allow_patterns, parse_exec_arguments, parse_request_arguments,
@@ -63,7 +63,11 @@ pub fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, Bo
         .token
         .or_else(|| read_env_var(VAULTICK_MCP_TOKEN_ENV_VAR))
         .or(file_config.token)
-        .ok_or_else(|| io::Error::other("missing MCP token; pass --token, set VAULTICK_MCP_TOKEN, or use --config"))?;
+        .ok_or_else(|| {
+            io::Error::other(
+                "missing MCP token; pass --token, set VAULTICK_MCP_TOKEN, or use --config",
+            )
+        })?;
 
     let db_path = if let Some(path) = overrides.db {
         path
@@ -204,7 +208,11 @@ pub async fn handle_message(state: SharedAppState, request: Request<Body>) -> Re
     let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
         Ok(bytes) => bytes,
         Err(err) => {
-            return json_error_response(None, JSONRPC_INVALID_REQUEST, &format!("failed to read request body: {err}"));
+            return json_error_response(
+                None,
+                JSONRPC_INVALID_REQUEST,
+                &format!("failed to read request body: {err}"),
+            );
         }
     };
     let payload = if body_bytes.is_empty() {
@@ -215,17 +223,37 @@ pub async fn handle_message(state: SharedAppState, request: Request<Body>) -> Re
 
     let raw_value: Value = match serde_json::from_slice(&payload) {
         Ok(value) => value,
-        Err(err) => return json_error_response(None, JSONRPC_PARSE_ERROR, &format!("invalid JSON-RPC payload: {err}")),
+        Err(err) => {
+            return json_error_response(
+                None,
+                JSONRPC_PARSE_ERROR,
+                &format!("invalid JSON-RPC payload: {err}"),
+            );
+        }
     };
     if raw_value.is_array() {
-        return json_error_response(None, JSONRPC_INVALID_REQUEST, "batch requests are not supported");
+        return json_error_response(
+            None,
+            JSONRPC_INVALID_REQUEST,
+            "batch requests are not supported",
+        );
     }
     let rpc_request: JsonRpcRequest = match serde_json::from_value(raw_value) {
         Ok(request) => request,
-        Err(err) => return json_error_response(None, JSONRPC_INVALID_REQUEST, &format!("invalid JSON-RPC request: {err}")),
+        Err(err) => {
+            return json_error_response(
+                None,
+                JSONRPC_INVALID_REQUEST,
+                &format!("invalid JSON-RPC request: {err}"),
+            );
+        }
     };
     if rpc_request.jsonrpc != "2.0" {
-        return json_error_response(rpc_request.id.clone(), JSONRPC_INVALID_REQUEST, "jsonrpc must be \"2.0\"");
+        return json_error_response(
+            rpc_request.id.clone(),
+            JSONRPC_INVALID_REQUEST,
+            "jsonrpc must be \"2.0\"",
+        );
     }
 
     if rpc_request.method == "initialize" {
@@ -238,7 +266,12 @@ pub async fn handle_message(state: SharedAppState, request: Request<Body>) -> Re
     };
     let protocol_version = match protocol_header {
         Some(value) => value,
-        None => return plain_response(StatusCode::BAD_REQUEST, "missing mcp-protocol-version header"),
+        None => {
+            return plain_response(
+                StatusCode::BAD_REQUEST,
+                "missing mcp-protocol-version header",
+            );
+        }
     };
 
     {
@@ -309,7 +342,8 @@ async fn handle_initialize(state: SharedAppState, request: JsonRpcRequest) -> Re
     let mut axum_response = json_response(response, Some(&session_id));
     axum_response.headers_mut().insert(
         MCP_PROTOCOL_HEADER,
-        HeaderValue::from_str(&protocol_version).unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_PROTOCOL_VERSION)),
+        HeaderValue::from_str(&protocol_version)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_PROTOCOL_VERSION)),
     );
     axum_response
 }
@@ -365,13 +399,17 @@ async fn handle_tools_call(
                 request.id,
                 JSONRPC_INVALID_PARAMS,
                 &format!("invalid tool call params: {err}"),
-            )
+            );
         }
     };
 
     match params.name.as_str() {
-        "vaultick.exec" => handle_exec_tool(state, session_id, accept_sse, request.id, params).await,
-        "vaultick.request" => handle_request_tool(state, session_id, accept_sse, request.id, params).await,
+        "vaultick.exec" => {
+            handle_exec_tool(state, session_id, accept_sse, request.id, params).await
+        }
+        "vaultick.request" => {
+            handle_request_tool(state, session_id, accept_sse, request.id, params).await
+        }
         _ => json_error_response(
             request.id,
             JSONRPC_INVALID_PARAMS,
@@ -389,12 +427,16 @@ async fn handle_exec_tool(
 ) -> Response<Body> {
     let arguments = match parse_exec_arguments(params.arguments.as_ref()) {
         Ok(arguments) => arguments,
-        Err(err) => return json_error_response(request_id, JSONRPC_INVALID_PARAMS, &err.to_string()),
+        Err(err) => {
+            return json_error_response(request_id, JSONRPC_INVALID_PARAMS, &err.to_string());
+        }
     };
 
     let vaultick = match Vaultick::open(&state.settings.db_path) {
         Ok(store) => store,
-        Err(err) => return json_error_response(request_id, JSONRPC_INTERNAL_ERROR, &err.to_string()),
+        Err(err) => {
+            return json_error_response(request_id, JSONRPC_INTERNAL_ERROR, &err.to_string());
+        }
     };
     let execution = match resolve_exec_execution(
         &vaultick,
@@ -408,13 +450,10 @@ async fn handle_exec_tool(
             return json_response(
                 tool_result_response(
                     request_id,
-                    tool_error(
-                        "vaultick.exec failed",
-                        json!({"message": err.to_string()}),
-                    ),
+                    tool_error("vaultick.exec failed", json!({"message": err.to_string()})),
                 ),
                 Some(&session_id),
-            )
+            );
         }
     };
 
@@ -424,13 +463,10 @@ async fn handle_exec_tool(
             return json_response(
                 tool_result_response(
                     request_id,
-                    tool_error(
-                        "vaultick.exec failed",
-                        json!({"message": err.to_string()}),
-                    ),
+                    tool_error("vaultick.exec failed", json!({"message": err.to_string()})),
                 ),
                 Some(&session_id),
-            )
+            );
         }
     };
 
@@ -468,13 +504,17 @@ async fn handle_request_tool(
 ) -> Response<Body> {
     let arguments = match parse_request_arguments(params.arguments.as_ref()) {
         Ok(arguments) => arguments,
-        Err(err) => return json_error_response(request_id, JSONRPC_INVALID_PARAMS, &err.to_string()),
+        Err(err) => {
+            return json_error_response(request_id, JSONRPC_INVALID_PARAMS, &err.to_string());
+        }
     };
     let use_sse_response = accept_sse && arguments.stream;
 
     let vaultick = match Vaultick::open(&state.settings.db_path) {
         Ok(store) => store,
-        Err(err) => return json_error_response(request_id, JSONRPC_INTERNAL_ERROR, &err.to_string()),
+        Err(err) => {
+            return json_error_response(request_id, JSONRPC_INTERNAL_ERROR, &err.to_string());
+        }
     };
     let execution = match resolve_request_execution(
         &vaultick,
@@ -493,7 +533,7 @@ async fn handle_request_tool(
                     ),
                 ),
                 Some(&session_id),
-            )
+            );
         }
     };
 
@@ -557,7 +597,7 @@ async fn handle_request_tool(
                     ),
                 ),
                 Some(&session_id),
-            )
+            );
         }
     };
 
@@ -798,7 +838,8 @@ where
     if let Some(session_id) = session_id {
         response.headers_mut().insert(
             MCP_SESSION_HEADER,
-            HeaderValue::from_str(session_id).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+            HeaderValue::from_str(session_id)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
         );
     }
     response
@@ -862,8 +903,14 @@ exec_allowlist:
   - git
 "#;
         let json = r#"{"listen":"127.0.0.1:4040","token":"secret","private_key":"/tmp/id_rsa","exec_allowlist":["git"]}"#;
-        assert_eq!(parse_config_text(yaml).unwrap().token.as_deref(), Some("secret"));
-        assert_eq!(parse_config_text(json).unwrap().token.as_deref(), Some("secret"));
+        assert_eq!(
+            parse_config_text(yaml).unwrap().token.as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            parse_config_text(json).unwrap().token.as_deref(),
+            Some("secret")
+        );
     }
 
     #[test]

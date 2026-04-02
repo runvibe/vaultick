@@ -7,7 +7,10 @@ use crate::services;
 
 pub fn router(state: SharedAppState) -> Router {
     Router::new()
-        .route("/mcp", get(get_sse).post(post_message).delete(delete_session))
+        .route(
+            "/mcp",
+            get(get_sse).post(post_message).delete(delete_session),
+        )
         .with_state(state)
 }
 

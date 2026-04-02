@@ -123,7 +123,10 @@ fn secret_set_and_get_metadata_are_case_insensitive_and_store_uppercase() {
         .unwrap();
     assert_success(&get_output);
     let stdout = String::from_utf8_lossy(&get_output.stdout);
-    assert!(stdout.contains("\tGOOGLE_TOKEN\t"));
+    assert!(stdout.contains("KEY"));
+    assert!(stdout.contains("SECRET ID"));
+    assert!(stdout.contains("GOOGLE_TOKEN"));
+    assert!(!stdout.contains("secret\t"));
 }
 
 #[test]
@@ -156,9 +159,108 @@ fn secret_get_and_list_support_json_output() {
         .unwrap();
     assert_success(&list_output);
     let list_json: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
-    assert!(list_json.is_array());
-    assert_eq!(list_json.as_array().unwrap().len(), 1);
-    assert_eq!(list_json[0]["key"], "GOOGLE_TOKEN");
+    assert!(list_json.is_object());
+    assert_eq!(list_json["limit"], 10);
+    assert_eq!(list_json["offset"], 0);
+    assert_eq!(list_json["count"], 1);
+    assert!(list_json["items"].is_array());
+    assert_eq!(list_json["items"].as_array().unwrap().len(), 1);
+    assert_eq!(list_json["items"][0]["key"], "GOOGLE_TOKEN");
+}
+
+#[test]
+fn secret_list_renders_table_and_paginates_by_default() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    for index in 0..12 {
+        assert_success(
+            &env.command()
+                .args([
+                    "secret",
+                    "set",
+                    &format!("secret_{index:02}"),
+                    &format!("value-{index}"),
+                ])
+                .output()
+                .unwrap(),
+        );
+    }
+
+    let list_output = env.command().args(["secret", "list"]).output().unwrap();
+    assert_success(&list_output);
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    assert!(stdout.contains("KEY"));
+    assert!(stdout.contains("SECRET ID"));
+    assert!(stdout.contains("SECRET_00"));
+    assert!(stdout.contains("SECRET_09"));
+    assert!(!stdout.contains("SECRET_10"));
+    assert!(!stdout.contains("secret\t"));
+}
+
+#[test]
+fn secret_list_offset_returns_next_page() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    for index in 0..12 {
+        assert_success(
+            &env.command()
+                .args([
+                    "secret",
+                    "set",
+                    &format!("secret_{index:02}"),
+                    &format!("value-{index}"),
+                ])
+                .output()
+                .unwrap(),
+        );
+    }
+
+    let offset_output = env
+        .command()
+        .args(["secret", "list", "--offset", "10"])
+        .output()
+        .unwrap();
+    assert_success(&offset_output);
+    let stdout = String::from_utf8_lossy(&offset_output.stdout);
+    assert!(stdout.contains("SECRET_10"));
+    assert!(stdout.contains("SECRET_11"));
+    assert!(!stdout.contains("SECRET_09"));
+}
+
+#[test]
+fn secret_list_json_supports_limit_and_offset() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+
+    for index in 0..12 {
+        assert_success(
+            &env.command()
+                .args([
+                    "secret",
+                    "set",
+                    &format!("secret_{index:02}"),
+                    &format!("value-{index}"),
+                ])
+                .output()
+                .unwrap(),
+        );
+    }
+
+    let list_output = env
+        .command()
+        .args(["secret", "list", "--limit", "5", "--offset", "5", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&list_output);
+    let list_json: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
+    assert_eq!(list_json["limit"], 5);
+    assert_eq!(list_json["offset"], 5);
+    assert_eq!(list_json["count"], 5);
+    assert_eq!(list_json["items"].as_array().unwrap().len(), 5);
+    assert_eq!(list_json["items"][0]["key"], "SECRET_05");
+    assert_eq!(list_json["items"][4]["key"], "SECRET_09");
 }
 
 #[test]
@@ -293,7 +395,9 @@ fn secret_set_file_accepts_binary_content() {
         .output()
         .unwrap();
     assert_success(&get_output);
-    assert!(String::from_utf8_lossy(&get_output.stdout).contains("\tBINARY_BLOB\t"));
+    let stdout = String::from_utf8_lossy(&get_output.stdout);
+    assert!(stdout.contains("KEY"));
+    assert!(stdout.contains("BINARY_BLOB"));
 }
 
 #[test]

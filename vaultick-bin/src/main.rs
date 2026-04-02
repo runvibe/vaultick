@@ -96,9 +96,7 @@ enum RsaSubcommand {
     #[command(about = "List RSA certificates in the active workspace")]
     List,
     #[command(about = "Delete an RSA certificate from the active workspace")]
-    Delete {
-        cert_ref: String,
-    },
+    Delete { cert_ref: String },
 }
 
 #[derive(Args, Debug)]
@@ -133,13 +131,15 @@ enum SecretSubcommand {
     },
     #[command(about = "List secrets in the active workspace")]
     List {
+        #[arg(long, default_value_t = 10, value_name = "N", value_parser = parse_positive_usize)]
+        limit: usize,
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        offset: usize,
         #[arg(long, default_value_t = false)]
         json: bool,
     },
     #[command(about = "Delete a secret")]
-    Delete {
-        key: String,
-    },
+    Delete { key: String },
 }
 
 #[derive(Args, Debug)]
@@ -414,17 +414,19 @@ fn handle_secret(
             if json {
                 print_secret_metadata_json(&secret)?;
             } else {
-                print_secret_metadata(&secret);
+                print_secret_metadata_table(std::slice::from_ref(&secret));
             }
         }
-        SecretSubcommand::List { json } => {
-            let secrets = vaultick.list_secrets(workspace_ref)?;
+        SecretSubcommand::List {
+            limit,
+            offset,
+            json,
+        } => {
+            let secrets = vaultick.list_secrets_paginated(workspace_ref, limit, offset)?;
             if json {
-                print_secret_metadata_list_json(&secrets)?;
+                print_secret_metadata_list_json(&secrets, limit, offset)?;
             } else {
-                for secret in secrets {
-                    print_secret_metadata(&secret);
-                }
+                print_secret_metadata_table(&secrets);
             }
         }
         SecretSubcommand::Delete { key } => {
@@ -650,6 +652,17 @@ fn normalize_secret_key(key: &str) -> Result<String, io::Error> {
     }
 
     Ok(normalized)
+}
+
+fn parse_positive_usize(input: &str) -> Result<usize, String> {
+    let value = input
+        .parse::<usize>()
+        .map_err(|_| format!("invalid positive integer: {input}"))?;
+    if value == 0 {
+        return Err("limit must be greater than 0".to_string());
+    }
+
+    Ok(value)
 }
 
 fn resolve_and_get_secret(
@@ -1158,6 +1171,49 @@ fn print_secret_metadata(secret: &SecretMetadata) {
     );
 }
 
+fn print_secret_metadata_table(secrets: &[SecretMetadata]) {
+    let key_width = secrets
+        .iter()
+        .map(|secret| secret.key.len())
+        .max()
+        .unwrap_or(3)
+        .max("KEY".len());
+    let id_width = secrets
+        .iter()
+        .map(|secret| secret.id.len())
+        .max()
+        .unwrap_or(9)
+        .max("SECRET ID".len());
+    let created_width = secrets
+        .iter()
+        .map(|secret| secret.created_at.len())
+        .max()
+        .unwrap_or(10)
+        .max("CREATED AT".len());
+    let updated_width = secrets
+        .iter()
+        .map(|secret| secret.updated_at.len())
+        .max()
+        .unwrap_or(10)
+        .max("UPDATED AT".len());
+
+    println!(
+        "{:<key_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
+        "KEY", "SECRET ID", "CREATED AT", "UPDATED AT",
+    );
+    println!(
+        "{:-<key_width$}  {:-<id_width$}  {:-<created_width$}  {:-<updated_width$}",
+        "", "", "", "",
+    );
+
+    for secret in secrets {
+        println!(
+            "{:<key_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
+            secret.key, secret.id, secret.created_at, secret.updated_at,
+        );
+    }
+}
+
 fn print_secret_metadata_json(secret: &SecretMetadata) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "{}",
@@ -1168,11 +1224,18 @@ fn print_secret_metadata_json(secret: &SecretMetadata) -> Result<(), Box<dyn std
 
 fn print_secret_metadata_list_json(
     secrets: &[SecretMetadata],
+    limit: usize,
+    offset: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let payload = secrets
-        .iter()
-        .map(secret_metadata_json_value)
-        .collect::<Vec<_>>();
+    let payload = json!({
+        "items": secrets
+            .iter()
+            .map(secret_metadata_json_value)
+            .collect::<Vec<_>>(),
+        "limit": limit,
+        "offset": offset,
+        "count": secrets.len(),
+    });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
 }
@@ -1772,10 +1835,44 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         let Command::Secret(command) = cli.command else {
             panic!("expected secret command");
         };
-        let SecretSubcommand::List { json } = command.command else {
+        let SecretSubcommand::List {
+            limit,
+            offset,
+            json,
+        } = command.command
+        else {
             panic!("expected secret list command");
         };
+        assert_eq!(limit, 10);
+        assert_eq!(offset, 0);
         assert!(json);
+    }
+
+    #[test]
+    fn secret_list_parses_limit_and_offset() {
+        let cli = Cli::try_parse_from([
+            "vaultick", "secret", "list", "--limit", "25", "--offset", "10",
+        ])
+        .unwrap();
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretSubcommand::List {
+            limit,
+            offset,
+            json,
+        } = command.command
+        else {
+            panic!("expected secret list command");
+        };
+        assert_eq!(limit, 25);
+        assert_eq!(offset, 10);
+        assert!(!json);
+    }
+
+    #[test]
+    fn secret_list_rejects_zero_limit() {
+        assert!(Cli::try_parse_from(["vaultick", "secret", "list", "--limit", "0"]).is_err());
     }
 
     #[test]

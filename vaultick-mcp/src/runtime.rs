@@ -95,7 +95,9 @@ impl<'a> SecretResolver<'a> {
 
 pub fn parse_exec_arguments(value: Option<&Value>) -> Result<ExecArguments, BoxError> {
     let args = serde_json::from_value::<ExecArguments>(
-        value.cloned().unwrap_or_else(|| Value::Object(Default::default())),
+        value
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default())),
     )?;
     if args.program.trim().is_empty() {
         return Err(io::Error::other("exec program cannot be empty").into());
@@ -105,7 +107,9 @@ pub fn parse_exec_arguments(value: Option<&Value>) -> Result<ExecArguments, BoxE
 
 pub fn parse_request_arguments(value: Option<&Value>) -> Result<RequestArguments, BoxError> {
     let args = serde_json::from_value::<RequestArguments>(
-        value.cloned().unwrap_or_else(|| Value::Object(Default::default())),
+        value
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default())),
     )?;
     if args.url.trim().is_empty() {
         return Err(io::Error::other("request url cannot be empty").into());
@@ -154,7 +158,9 @@ pub fn resolve_exec_execution(
 
     for (name, raw_value) in &arguments.assignments {
         if !is_valid_env_var_name(name) {
-            return Err(io::Error::other(format!("invalid environment variable name: {name}")).into());
+            return Err(
+                io::Error::other(format!("invalid environment variable name: {name}")).into(),
+            );
         }
         let template = if raw_value.is_empty() {
             format!("${name}")
@@ -173,9 +179,7 @@ pub fn resolve_exec_execution(
     })
 }
 
-pub fn run_exec_execution(
-    execution: &ExecExecution,
-) -> Result<ExecResult, BoxError> {
+pub fn run_exec_execution(execution: &ExecExecution) -> Result<ExecResult, BoxError> {
     let mut child = ProcessCommand::new(&execution.program);
     child.args(&execution.args);
     child.envs(execution.env_vars.iter().map(|(key, value)| (key, value)));
@@ -249,7 +253,12 @@ pub async fn collect_request_result(
     let headers = response
         .headers()
         .iter()
-        .filter_map(|(name, value)| value.to_str().ok().map(|value| (name.to_string(), value.to_string())))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
         .collect::<HashMap<_, _>>();
 
     let mut body_bytes = Vec::new();
@@ -279,9 +288,14 @@ pub async fn execute_request(
     mut on_chunk: impl FnMut(String) + Send,
 ) -> Result<RequestResult, BoxError> {
     let response = execute_async_with_client(client, &execution.request).await?;
-    collect_request_result(response, &execution.request, &execution.redacted_values, move |chunk| {
-        on_chunk(chunk);
-    })
+    collect_request_result(
+        response,
+        &execution.request,
+        &execution.redacted_values,
+        move |chunk| {
+            on_chunk(chunk);
+        },
+    )
     .await
 }
 
@@ -376,7 +390,8 @@ mod tests {
 
     #[test]
     fn command_allowlist_matches_prefix_tokens() {
-        let allowlist = parse_exec_allow_patterns(&["git".to_string(), "aws s3".to_string()]).unwrap();
+        let allowlist =
+            parse_exec_allow_patterns(&["git".to_string(), "aws s3".to_string()]).unwrap();
         assert!(command_allowed(
             &allowlist,
             &requested_command_tokens("git", &["status".to_string()])

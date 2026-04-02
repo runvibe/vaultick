@@ -426,7 +426,7 @@ fn handle_secret(
             if json {
                 print_secret_metadata_list_json(&secrets, limit, offset)?;
             } else {
-                print_secret_metadata_table(&secrets);
+                print_secret_metadata_list_table(&secrets, limit, offset);
             }
         }
         SecretSubcommand::Delete { key } => {
@@ -1212,6 +1212,12 @@ fn print_secret_metadata_table(secrets: &[SecretMetadata]) {
             secret.key, secret.id, secret.created_at, secret.updated_at,
         );
     }
+}
+
+fn print_secret_metadata_list_table(secrets: &[SecretMetadata], limit: usize, offset: usize) {
+    println!("limit: {limit}  offset: {offset}  count: {}", secrets.len());
+    println!();
+    print_secret_metadata_table(secrets);
 }
 
 fn print_secret_metadata_json(secret: &SecretMetadata) -> Result<(), Box<dyn std::error::Error>> {

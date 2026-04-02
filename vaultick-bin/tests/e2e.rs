@@ -190,6 +190,7 @@ fn secret_list_renders_table_and_paginates_by_default() {
     let list_output = env.command().args(["secret", "list"]).output().unwrap();
     assert_success(&list_output);
     let stdout = String::from_utf8_lossy(&list_output.stdout);
+    assert!(stdout.contains("limit: 10  offset: 0  count: 10"));
     assert!(stdout.contains("KEY"));
     assert!(stdout.contains("SECRET ID"));
     assert!(stdout.contains("SECRET_00"));
@@ -224,6 +225,7 @@ fn secret_list_offset_returns_next_page() {
         .unwrap();
     assert_success(&offset_output);
     let stdout = String::from_utf8_lossy(&offset_output.stdout);
+    assert!(stdout.contains("limit: 10  offset: 10  count: 2"));
     assert!(stdout.contains("SECRET_10"));
     assert!(stdout.contains("SECRET_11"));
     assert!(!stdout.contains("SECRET_09"));

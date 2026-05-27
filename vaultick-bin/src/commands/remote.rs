@@ -13,6 +13,8 @@ use super::{
 use vaultick::{Vaultick, compression};
 
 const REMOTE_PROTOCOL_VERSION: u32 = 1;
+const REMOTE_REQUEST_FRAME_MAGIC: &[u8] = b"VAULTICK-REMOTE-REQUEST-2\n";
+const REMOTE_RESPONSE_FRAME_MAGIC: &[u8] = b"VAULTICK-REMOTE-RESPONSE-2\n";
 const FILE_PLACEHOLDER_PREFIX: &str = "__vaultick_remote_file_";
 const VAULTICK_REMOTE_BIN_ENV_VAR: &str = "VAULTICK_REMOTE_BIN";
 const VAULTICK_REMOTE_SSH_COMMAND_ENV_VAR: &str = "VAULTICK_REMOTE_SSH_COMMAND";
@@ -121,6 +123,52 @@ pub(crate) struct RemoteSecretPayload {
     pub(crate) payload: Vec<u8>,
     pub(crate) compression: String,
     pub(crate) original_size: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FramedRemoteRequestHeader {
+    protocol_version: u32,
+    args: Vec<String>,
+    vaultick_home: Option<String>,
+    workspace: Option<String>,
+    stdin_len: u64,
+    files: Vec<FramedRemoteFileHeader>,
+    secret_operation: Option<FramedRemoteSecretOperationHeader>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FramedRemoteFileHeader {
+    placeholder: String,
+    len: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum FramedRemoteSecretOperationHeader {
+    SetPreparedFile {
+        key: String,
+        payload_len: u64,
+        compression: String,
+        original_size: Option<u64>,
+        overwrite: bool,
+    },
+    GetRawFile {
+        key: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FramedRemoteResponseHeader {
+    stdout_len: u64,
+    stderr_len: u64,
+    exit_code: i32,
+    secret_payload: Option<FramedRemoteSecretPayloadHeader>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FramedRemoteSecretPayloadHeader {
+    payload_len: u64,
+    compression: String,
+    original_size: Option<u64>,
 }
 
 pub(crate) fn prepare_remote_request(
@@ -255,11 +303,9 @@ pub(crate) fn dispatch_remote(
 }
 
 pub(crate) fn handle_remote_stdio() -> Result<i32, Box<dyn std::error::Error>> {
-    let mut input = Vec::new();
-    io::stdin().lock().read_to_end(&mut input)?;
-    let request: RemoteRequest = serde_json::from_slice(&input)?;
+    let request = read_remote_request(io::stdin().lock())?;
     let response = execute_remote_request(request);
-    serde_json::to_writer(io::stdout().lock(), &response)?;
+    write_remote_response(io::stdout().lock(), &response)?;
     Ok(0)
 }
 
@@ -293,7 +339,7 @@ fn dispatch_remote_request(
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("failed to open SSH stdin"))?;
-        serde_json::to_writer(&mut child_stdin, request)?;
+        write_remote_request(&mut child_stdin, request)?;
     }
 
     let output = child.wait_with_output()?;
@@ -306,7 +352,7 @@ fn dispatch_remote_request(
         .into());
     }
 
-    let response: RemoteResponse = serde_json::from_slice(&output.stdout).map_err(|err| {
+    let response = read_remote_response(&output.stdout[..]).map_err(|err| {
         io::Error::other(format!(
             "remote command did not return a valid Vaultick response: {err}"
         ))
@@ -334,6 +380,202 @@ fn dispatch_remote_request(
     stdout.write_all(&response.stdout)?;
     stderr.write_all(&response.stderr)?;
     Ok(response.exit_code)
+}
+
+fn write_remote_request(
+    mut writer: impl Write,
+    request: &RemoteRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let secret_operation = request
+        .secret_operation
+        .as_ref()
+        .map(|operation| match operation {
+            RemoteSecretOperation::SetPreparedFile {
+                key,
+                payload,
+                compression,
+                original_size,
+                overwrite,
+            } => FramedRemoteSecretOperationHeader::SetPreparedFile {
+                key: key.clone(),
+                payload_len: payload.len() as u64,
+                compression: compression.clone(),
+                original_size: *original_size,
+                overwrite: *overwrite,
+            },
+            RemoteSecretOperation::GetRawFile { key } => {
+                FramedRemoteSecretOperationHeader::GetRawFile { key: key.clone() }
+            }
+        });
+    let header = FramedRemoteRequestHeader {
+        protocol_version: request.protocol_version,
+        args: request.args.clone(),
+        vaultick_home: request.vaultick_home.clone(),
+        workspace: request.workspace.clone(),
+        stdin_len: request.stdin.len() as u64,
+        files: request
+            .files
+            .iter()
+            .map(|file| FramedRemoteFileHeader {
+                placeholder: file.placeholder.clone(),
+                len: file.contents.len() as u64,
+            })
+            .collect(),
+        secret_operation,
+    };
+    let header = serde_json::to_vec(&header)?;
+    writer.write_all(REMOTE_REQUEST_FRAME_MAGIC)?;
+    write_u64(&mut writer, header.len() as u64)?;
+    writer.write_all(&header)?;
+    writer.write_all(&request.stdin)?;
+    for file in &request.files {
+        writer.write_all(&file.contents)?;
+    }
+    if let Some(RemoteSecretOperation::SetPreparedFile { payload, .. }) =
+        request.secret_operation.as_ref()
+    {
+        writer.write_all(payload)?;
+    }
+    Ok(())
+}
+
+fn read_remote_request(mut reader: impl Read) -> Result<RemoteRequest, Box<dyn std::error::Error>> {
+    let mut prefix = vec![0; REMOTE_REQUEST_FRAME_MAGIC.len()];
+    reader.read_exact(&mut prefix)?;
+    if prefix != REMOTE_REQUEST_FRAME_MAGIC {
+        let mut input = prefix;
+        reader.read_to_end(&mut input)?;
+        return Ok(serde_json::from_slice(&input)?);
+    }
+
+    let header_len = read_u64(&mut reader)?;
+    let mut header = vec![0; header_len as usize];
+    reader.read_exact(&mut header)?;
+    let header: FramedRemoteRequestHeader = serde_json::from_slice(&header)?;
+
+    let stdin = read_exact_vec(&mut reader, header.stdin_len)?;
+    let mut files = Vec::with_capacity(header.files.len());
+    for file in header.files {
+        files.push(RemoteFilePayload {
+            placeholder: file.placeholder,
+            contents: read_exact_vec(&mut reader, file.len)?,
+        });
+    }
+    let secret_operation = match header.secret_operation {
+        Some(FramedRemoteSecretOperationHeader::SetPreparedFile {
+            key,
+            payload_len,
+            compression,
+            original_size,
+            overwrite,
+        }) => Some(RemoteSecretOperation::SetPreparedFile {
+            key,
+            payload: read_exact_vec(&mut reader, payload_len)?,
+            compression,
+            original_size,
+            overwrite,
+        }),
+        Some(FramedRemoteSecretOperationHeader::GetRawFile { key }) => {
+            Some(RemoteSecretOperation::GetRawFile { key })
+        }
+        None => None,
+    };
+
+    Ok(RemoteRequest {
+        protocol_version: header.protocol_version,
+        args: header.args,
+        vaultick_home: header.vaultick_home,
+        workspace: header.workspace,
+        stdin,
+        files,
+        secret_operation,
+        local_output: None,
+    })
+}
+
+fn write_remote_response(
+    mut writer: impl Write,
+    response: &RemoteResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let secret_payload =
+        response
+            .secret_payload
+            .as_ref()
+            .map(|payload| FramedRemoteSecretPayloadHeader {
+                payload_len: payload.payload.len() as u64,
+                compression: payload.compression.clone(),
+                original_size: payload.original_size,
+            });
+    let header = FramedRemoteResponseHeader {
+        stdout_len: response.stdout.len() as u64,
+        stderr_len: response.stderr.len() as u64,
+        exit_code: response.exit_code,
+        secret_payload,
+    };
+    let header = serde_json::to_vec(&header)?;
+    writer.write_all(REMOTE_RESPONSE_FRAME_MAGIC)?;
+    write_u64(&mut writer, header.len() as u64)?;
+    writer.write_all(&header)?;
+    writer.write_all(&response.stdout)?;
+    writer.write_all(&response.stderr)?;
+    if let Some(payload) = response.secret_payload.as_ref() {
+        writer.write_all(&payload.payload)?;
+    }
+    Ok(())
+}
+
+fn read_remote_response(
+    mut reader: impl Read,
+) -> Result<RemoteResponse, Box<dyn std::error::Error>> {
+    let mut prefix = vec![0; REMOTE_RESPONSE_FRAME_MAGIC.len()];
+    reader.read_exact(&mut prefix)?;
+    if prefix != REMOTE_RESPONSE_FRAME_MAGIC {
+        let mut input = prefix;
+        reader.read_to_end(&mut input)?;
+        return Ok(serde_json::from_slice(&input)?);
+    }
+
+    let header_len = read_u64(&mut reader)?;
+    let mut header = vec![0; header_len as usize];
+    reader.read_exact(&mut header)?;
+    let header: FramedRemoteResponseHeader = serde_json::from_slice(&header)?;
+
+    let stdout = read_exact_vec(&mut reader, header.stdout_len)?;
+    let stderr = read_exact_vec(&mut reader, header.stderr_len)?;
+    let secret_payload = match header.secret_payload {
+        Some(payload) => Some(RemoteSecretPayload {
+            payload: read_exact_vec(&mut reader, payload.payload_len)?,
+            compression: payload.compression,
+            original_size: payload.original_size,
+        }),
+        None => None,
+    };
+
+    Ok(RemoteResponse {
+        stdout,
+        stderr,
+        exit_code: header.exit_code,
+        secret_payload,
+    })
+}
+
+fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_exact_vec(reader: &mut impl Read, len: u64) -> io::Result<Vec<u8>> {
+    let len: usize = len
+        .try_into()
+        .map_err(|_| io::Error::other("remote frame is too large for this platform"))?;
+    let mut bytes = vec![0; len];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn execute_remote_request(request: RemoteRequest) -> RemoteResponse {
@@ -687,6 +929,56 @@ mod tests {
         let local_output = request.local_output.unwrap();
         assert_eq!(local_output.path, "payload.bin");
         assert!(local_output.no_uncompress);
+    }
+
+    #[test]
+    fn framed_request_encoding_keeps_prepared_file_payload_binary() {
+        let payload = vec![7; 1024 * 1024];
+        let request = RemoteRequest {
+            protocol_version: REMOTE_PROTOCOL_VERSION,
+            args: Vec::new(),
+            vaultick_home: Some("/vault".to_string()),
+            workspace: Some("default".to_string()),
+            stdin: Vec::new(),
+            files: Vec::new(),
+            secret_operation: Some(RemoteSecretOperation::SetPreparedFile {
+                key: "VIDEO".to_string(),
+                payload: payload.clone(),
+                compression: "none".to_string(),
+                original_size: None,
+                overwrite: true,
+            }),
+            local_output: None,
+        };
+
+        let mut encoded = Vec::new();
+        write_remote_request(&mut encoded, &request).unwrap();
+
+        assert!(encoded.len() < payload.len() + 4096);
+        let decoded = read_remote_request(Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.secret_operation, request.secret_operation);
+    }
+
+    #[test]
+    fn framed_response_encoding_keeps_secret_payload_binary() {
+        let payload = vec![9; 1024 * 1024];
+        let response = RemoteResponse {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: 0,
+            secret_payload: Some(RemoteSecretPayload {
+                payload: payload.clone(),
+                compression: "none".to_string(),
+                original_size: None,
+            }),
+        };
+
+        let mut encoded = Vec::new();
+        write_remote_response(&mut encoded, &response).unwrap();
+
+        assert!(encoded.len() < payload.len() + 4096);
+        let decoded = read_remote_response(Cursor::new(encoded)).unwrap();
+        assert_eq!(decoded.secret_payload, response.secret_payload);
     }
 
     #[test]

@@ -73,7 +73,10 @@ pub fn validate_level(level: i32) -> Result<i32> {
     Ok(level)
 }
 
-pub fn prepare_secret_payload(input: &[u8], mode: CompressionMode) -> Result<PreparedSecretPayload> {
+pub fn prepare_secret_payload(
+    input: &[u8],
+    mode: CompressionMode,
+) -> Result<PreparedSecretPayload> {
     match mode {
         CompressionMode::None => Ok(PreparedSecretPayload {
             payload: input.to_vec(),

@@ -155,9 +155,9 @@ pub(crate) fn prepare_remote_request(
                 }
 
                 if let Some(path) = file {
-                    let key = key.clone().ok_or_else(|| {
-                        io::Error::other("missing secret key or use --env-file")
-                    })?;
+                    let key = key
+                        .clone()
+                        .ok_or_else(|| io::Error::other("missing secret key or use --env-file"))?;
                     let file_contents = fs::read(path)?;
                     let prepared = compression::prepare_secret_payload(
                         &file_contents,
@@ -650,7 +650,10 @@ mod tests {
         };
         assert_eq!(key, "PAYLOAD");
         assert_eq!(compression, "zstd");
-        assert_eq!(original_size, Some(b"secret-bytes".repeat(256).len() as u64));
+        assert_eq!(
+            original_size,
+            Some(b"secret-bytes".repeat(256).len() as u64)
+        );
         assert!(!overwrite);
         assert!(payload.len() < b"secret-bytes".repeat(256).len());
     }

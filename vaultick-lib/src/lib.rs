@@ -822,26 +822,27 @@ fn secret_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<SecretMetadata> {
 
 fn secret_record_from_row(row: &Row<'_>) -> rusqlite::Result<SecretRecord> {
     let compression: String = row.get(5)?;
-    let compression =
-        compression
-            .parse::<compression::Compression>()
-            .map_err(|err| match err {
-                VaultickError::Validation(message) => rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    Type::Text,
-                    Box::new(std::io::Error::other(message)),
-                ),
-                other => rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    Type::Text,
-                    Box::new(std::io::Error::other(other.to_string())),
-                ),
-            })?;
+    let compression = compression
+        .parse::<compression::Compression>()
+        .map_err(|err| match err {
+            VaultickError::Validation(message) => rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                Box::new(std::io::Error::other(message)),
+            ),
+            other => rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                Box::new(std::io::Error::other(other.to_string())),
+            ),
+        })?;
     let original_size: Option<i64> = row.get(6)?;
     let original_size = original_size
         .map(u64::try_from)
         .transpose()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(err)))?;
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(err))
+        })?;
 
     Ok(SecretRecord {
         metadata: SecretMetadata {
@@ -1528,12 +1529,13 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         store
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
-        let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(32);
-        let prepared =
-            compression::prepare_secret_payload(&payload, compression::CompressionMode::Try {
-                level: 10,
-            })
-            .unwrap();
+        let payload =
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(32);
+        let prepared = compression::prepare_secret_payload(
+            &payload,
+            compression::CompressionMode::Try { level: 10 },
+        )
+        .unwrap();
         assert_eq!(prepared.compression, compression::Compression::Zstd);
 
         store
@@ -1559,11 +1561,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .add_certificate("team-a", "primary", CERT_1, None)
             .unwrap();
         let payload = b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(64);
-        let prepared =
-            compression::prepare_secret_payload(&payload, compression::CompressionMode::Force {
-                level: 10,
-            })
-            .unwrap();
+        let prepared = compression::prepare_secret_payload(
+            &payload,
+            compression::CompressionMode::Force { level: 10 },
+        )
+        .unwrap();
 
         store
             .set_secret_prepared_bytes(

@@ -222,6 +222,13 @@ enum ResolvedSecretSetRequest {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SecretSetCompressionOptions {
+    compress: bool,
+    compress_level: Option<i32>,
+    no_compress: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedRequestInvocation {
     request: ResolvedRequest,
@@ -382,9 +389,11 @@ fn handle_secret(
                 stdin,
                 file.as_deref(),
                 env_file.as_deref(),
-                compress,
-                compress_level,
-                no_compress,
+                SecretSetCompressionOptions {
+                    compress,
+                    compress_level,
+                    no_compress,
+                },
                 &mut stdin_reader,
             )?;
             match request {
@@ -608,11 +617,15 @@ fn resolve_secret_set_request(
     stdin: bool,
     file: Option<&str>,
     env_file: Option<&str>,
-    compress: bool,
-    compress_level: Option<i32>,
-    no_compress: bool,
+    compression_options: SecretSetCompressionOptions,
     reader: &mut impl Read,
 ) -> Result<ResolvedSecretSetRequest, Box<dyn std::error::Error>> {
+    let SecretSetCompressionOptions {
+        compress,
+        compress_level,
+        no_compress,
+    } = compression_options;
+
     if let Some(env_file) = env_file {
         if key.is_some()
             || value.is_some()
@@ -777,7 +790,7 @@ fn parse_positive_usize(input: &str) -> Result<usize, String> {
 fn parse_compression_level(input: &str) -> Result<i32, String> {
     let level = input
         .parse::<i32>()
-        .map_err(|_| format!("invalid compression level: expected 1..=22"))?;
+        .map_err(|_| "invalid compression level: expected 1..=22".to_string())?;
     compression::validate_level(level).map_err(|err| err.to_string())
 }
 
@@ -1974,9 +1987,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             Some("-"),
-            false,
-            None,
-            false,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(
                 b"github_token=ghp_123\nexport aws_access_key_id=\"AKIA123\"\n".to_vec(),
             ),
@@ -1999,9 +2014,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             Some(".env"),
-            false,
-            None,
-            false,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut reader,
         )
         .unwrap_err();
@@ -2166,9 +2183,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             None,
-            false,
-            None,
-            false,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap();
@@ -2199,9 +2218,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             Some(path.to_str().unwrap()),
             None,
-            false,
-            None,
-            true,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: true,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap();
@@ -2228,9 +2249,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             Some("secret.txt"),
             None,
-            false,
-            None,
-            false,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap_err();

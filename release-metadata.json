@@ -1,16 +1,16 @@
 {
   "links": {
-    "vaultick_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-linux-amd64",
-    "vaultick_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-linux-arm64",
-    "vaultick_linux_armv7": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-linux-armv7",
-    "vaultick_macos_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-macos-amd64",
-    "vaultick_macos_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-macos-arm64",
-    "vaultick_proxy_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-proxy-linux-amd64",
-    "vaultick_proxy_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-proxy-linux-arm64",
-    "vaultick_windows_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.3/vaultick-windows-amd64.exe"
+    "vaultick_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-linux-amd64",
+    "vaultick_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-linux-arm64",
+    "vaultick_linux_armv7": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-linux-armv7",
+    "vaultick_macos_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-macos-amd64",
+    "vaultick_macos_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-macos-arm64",
+    "vaultick_proxy_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-proxy-linux-amd64",
+    "vaultick_proxy_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-proxy-linux-arm64",
+    "vaultick_windows_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.4/vaultick-windows-amd64.exe"
   },
   "name": "vaultick",
-  "published_at": "2026-05-27T03:50:21Z",
-  "tag": "v0.0.1-alpha.3",
-  "version": "0.0.1-alpha.3"
+  "published_at": "2026-05-27T14:30:13Z",
+  "tag": "v0.0.1-alpha.4",
+  "version": "0.0.1-alpha.4"
 }

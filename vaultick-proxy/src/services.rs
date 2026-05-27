@@ -18,8 +18,8 @@ use vaultick_request::{
 };
 
 use crate::models::{
-    AppState, CompiledRoute, ProxyConfigFile, RequestContext, ResolvedSettings, RouteConfig,
-    SharedAppState, StartupOverrides,
+    AppState, CompiledRoute, DEFAULT_MAX_REQUEST_BODY_BYTES, ProxyConfigFile, RequestContext,
+    ResolvedSettings, RouteConfig, SharedAppState, StartupOverrides,
 };
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -62,12 +62,16 @@ pub async fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettin
         })?;
 
     let listen = overrides.listen.unwrap_or(file_config.listen.clone());
+    let max_request_body_bytes = file_config
+        .max_request_body_bytes
+        .unwrap_or(DEFAULT_MAX_REQUEST_BODY_BYTES);
 
     Ok(ResolvedSettings {
         listen,
         db_path,
         workspace,
         private_key_path,
+        max_request_body_bytes,
         routes: file_config.routes,
     })
 }
@@ -96,6 +100,7 @@ pub fn build_state(settings: &ResolvedSettings) -> Result<SharedAppState, BoxErr
 
     Ok(Arc::new(AppState {
         client: AsyncClient::builder().build()?,
+        max_request_body_bytes: settings.max_request_body_bytes,
         routes: compiled_routes,
     }))
 }
@@ -205,12 +210,25 @@ async fn forward_request(
     request: Request<Body>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let (parts, body) = request.into_parts();
-    let body_bytes = to_bytes(body, usize::MAX).await.map_err(|err| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("failed to read request body: {err}"),
-        )
-    })?;
+    let body_bytes = to_bytes(body, state.max_request_body_bytes)
+        .await
+        .map_err(|err| {
+            let message = err.to_string();
+            if message.contains("length limit") {
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!(
+                        "request body too large; limit is {} bytes",
+                        state.max_request_body_bytes
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("failed to read request body: {err}"),
+                )
+            }
+        })?;
 
     let request_context = build_request_context(
         &parts.method,

@@ -439,6 +439,35 @@ async fn proxy_returns_404_when_no_route_matches() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_rejects_request_body_over_configured_limit() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nmax_request_body_bytes: 4\nroutes:\n  - match:\n      path_prefix: /limited\n    forward:\n      base_url: http://127.0.0.1:1\n      path: /echo\n",
+        listen = listen_addr,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    ));
+
+    let _guard = spawn_proxy_process(&config_path, &listen_addr).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://{listen_addr}/limited"))
+        .body("12345")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("request body too large")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_returns_502_when_upstream_is_unreachable() {
     let env = TestEnv::new();
     let listen_addr = free_addr();

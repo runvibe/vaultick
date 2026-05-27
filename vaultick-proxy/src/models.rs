@@ -6,12 +6,16 @@ use std::time::Duration;
 use serde::Deserialize;
 use vaultick_request::AsyncClient;
 
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyConfigFile {
     pub listen: String,
     pub db: Option<PathBuf>,
     pub workspace: Option<String>,
     pub private_key: Option<PathBuf>,
+    #[serde(default)]
+    pub max_request_body_bytes: Option<usize>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 }
@@ -57,6 +61,7 @@ pub struct ResolvedSettings {
     pub db_path: PathBuf,
     pub workspace: String,
     pub private_key_path: PathBuf,
+    pub max_request_body_bytes: usize,
     pub routes: Vec<RouteConfig>,
 }
 
@@ -77,6 +82,7 @@ pub struct CompiledRoute {
 #[derive(Debug)]
 pub struct AppState {
     pub client: AsyncClient,
+    pub max_request_body_bytes: usize,
     pub routes: Vec<CompiledRoute>,
 }
 

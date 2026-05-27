@@ -20,47 +20,7 @@ use x509_parser::nom::AsBytes;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::FromDer;
 
-const SCHEMA: &str = r#"
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS workspaces (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE TABLE IF NOT EXISTS rsa_certificates (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL,
-    label TEXT NOT NULL,
-    cert_pem TEXT NOT NULL,
-    fingerprint_sha256 TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
-    UNIQUE(workspace_id, fingerprint_sha256)
-);
-
-CREATE TABLE IF NOT EXISTS secrets (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    nonce BLOB NOT NULL,
-    ciphertext BLOB NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
-    UNIQUE(workspace_id, key)
-);
-
-CREATE TABLE IF NOT EXISTS secret_recipients (
-    secret_id TEXT NOT NULL,
-    rsa_certificate_id TEXT NOT NULL,
-    wrapped_key BLOB NOT NULL,
-    PRIMARY KEY (secret_id, rsa_certificate_id),
-    FOREIGN KEY(secret_id) REFERENCES secrets(id) ON DELETE CASCADE,
-    FOREIGN KEY(rsa_certificate_id) REFERENCES rsa_certificates(id) ON DELETE CASCADE
-);
-"#;
+const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
@@ -612,7 +572,7 @@ impl Vaultick {
 
     fn init_schema(&self, create_default_workspace: bool) -> Result<()> {
         let conn = self.conn.borrow();
-        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(INITIAL_SCHEMA)?;
 
         if create_default_workspace {
             let default_id = Uuid::new_v4().to_string();
@@ -1158,6 +1118,18 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
 
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, DEFAULT_WORKSPACE_NAME);
+    }
+
+    #[test]
+    fn new_database_records_schema_version() {
+        let (_dir, store) = new_store();
+        let version: i64 = store
+            .conn
+            .borrow()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(version, 1);
     }
 
     #[test]

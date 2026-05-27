@@ -111,9 +111,7 @@ pub(crate) fn prepare_remote_request(
                 env_file,
                 ..
             } => {
-                if *read_stdin {
-                    reader.read_to_end(&mut stdin)?;
-                } else if env_file.as_deref() == Some("-") {
+                if *read_stdin || env_file.as_deref() == Some("-") {
                     reader.read_to_end(&mut stdin)?;
                 }
 

@@ -1313,6 +1313,24 @@ fn print_secret_metadata_table(secrets: &[SecretMetadata]) {
         .max()
         .unwrap_or(9)
         .max("SECRET ID".len());
+    let stored_bytes_width = secrets
+        .iter()
+        .map(|secret| secret.stored_bytes.to_string().len())
+        .max()
+        .unwrap_or(12)
+        .max("STORED BYTES".len());
+    let original_bytes_width = secrets
+        .iter()
+        .map(|secret| secret.original_bytes.to_string().len())
+        .max()
+        .unwrap_or(14)
+        .max("ORIGINAL BYTES".len());
+    let compression_width = secrets
+        .iter()
+        .map(|secret| secret.compression.as_str().len())
+        .max()
+        .unwrap_or(11)
+        .max("COMPRESSION".len());
     let created_width = secrets
         .iter()
         .map(|secret| secret.created_at.len())
@@ -1327,18 +1345,30 @@ fn print_secret_metadata_table(secrets: &[SecretMetadata]) {
         .max("UPDATED AT".len());
 
     println!(
-        "{:<key_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
-        "KEY", "SECRET ID", "CREATED AT", "UPDATED AT",
+        "{:<key_width$}  {:>stored_bytes_width$}  {:>original_bytes_width$}  {:<compression_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
+        "KEY",
+        "STORED BYTES",
+        "ORIGINAL BYTES",
+        "COMPRESSION",
+        "SECRET ID",
+        "CREATED AT",
+        "UPDATED AT",
     );
     println!(
-        "{:-<key_width$}  {:-<id_width$}  {:-<created_width$}  {:-<updated_width$}",
-        "", "", "", "",
+        "{:-<key_width$}  {:-<stored_bytes_width$}  {:-<original_bytes_width$}  {:-<compression_width$}  {:-<id_width$}  {:-<created_width$}  {:-<updated_width$}",
+        "", "", "", "", "", "", "",
     );
 
     for secret in secrets {
         println!(
-            "{:<key_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
-            secret.key, secret.id, secret.created_at, secret.updated_at,
+            "{:<key_width$}  {:>stored_bytes_width$}  {:>original_bytes_width$}  {:<compression_width$}  {:<id_width$}  {:<created_width$}  {:<updated_width$}",
+            secret.key,
+            secret.stored_bytes,
+            secret.original_bytes,
+            secret.compression.as_str(),
+            secret.id,
+            secret.created_at,
+            secret.updated_at,
         );
     }
 }
@@ -1380,6 +1410,9 @@ fn secret_metadata_json_value(secret: &SecretMetadata) -> serde_json::Value {
         "id": secret.id,
         "workspace_id": secret.workspace_id,
         "key": secret.key,
+        "stored_bytes": secret.stored_bytes,
+        "original_bytes": secret.original_bytes,
+        "compression": secret.compression.as_str(),
         "created_at": secret.created_at,
         "updated_at": secret.updated_at,
     })

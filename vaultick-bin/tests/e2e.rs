@@ -274,7 +274,13 @@ fn secret_set_and_get_metadata_are_case_insensitive_and_store_uppercase() {
     let stdout = String::from_utf8_lossy(&get_output.stdout);
     assert!(stdout.contains("KEY"));
     assert!(stdout.contains("SECRET ID"));
+    assert!(stdout.contains("STORED BYTES"));
+    assert!(stdout.contains("ORIGINAL BYTES"));
+    assert!(stdout.contains("COMPRESSION"));
     assert!(stdout.contains("GOOGLE_TOKEN"));
+    assert!(stdout.contains("34"));
+    assert!(stdout.contains("18"));
+    assert!(stdout.contains("none"));
     assert!(!stdout.contains("secret\t"));
 }
 
@@ -300,6 +306,9 @@ fn secret_get_and_list_support_json_output() {
     assert_eq!(get_json["key"], "GOOGLE_TOKEN");
     assert!(get_json["id"].is_string());
     assert!(get_json["workspace_id"].is_string());
+    assert_eq!(get_json["stored_bytes"], 34);
+    assert_eq!(get_json["original_bytes"], 18);
+    assert_eq!(get_json["compression"], "none");
 
     let list_output = env
         .command()
@@ -315,6 +324,47 @@ fn secret_get_and_list_support_json_output() {
     assert!(list_json["items"].is_array());
     assert_eq!(list_json["items"].as_array().unwrap().len(), 1);
     assert_eq!(list_json["items"][0]["key"], "GOOGLE_TOKEN");
+    assert_eq!(list_json["items"][0]["stored_bytes"], 34);
+    assert_eq!(list_json["items"][0]["original_bytes"], 18);
+    assert_eq!(list_json["items"][0]["compression"], "none");
+}
+
+#[test]
+fn compressed_secret_metadata_reports_stored_and_original_sizes() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+    let input = env.home.join("payload.txt");
+    let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(64);
+    fs::write(&input, &payload).unwrap();
+
+    assert_success(
+        &env.command()
+            .args([
+                "secret",
+                "set",
+                "archive",
+                "--file",
+                input.to_str().unwrap(),
+                "--compress",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    let output = env
+        .command()
+        .args(["secret", "get", "archive", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stored_bytes = json["stored_bytes"].as_u64().unwrap();
+
+    assert_eq!(json["key"], "ARCHIVE");
+    assert_eq!(json["compression"], "zstd");
+    assert_eq!(json["original_bytes"], payload.len() as u64);
+    assert!(stored_bytes > 0);
+    assert!(stored_bytes < payload.len() as u64);
 }
 
 #[test]
@@ -342,6 +392,9 @@ fn secret_list_renders_table_and_paginates_by_default() {
     assert!(stdout.contains("limit: 10  offset: 0  count: 10"));
     assert!(stdout.contains("KEY"));
     assert!(stdout.contains("SECRET ID"));
+    assert!(stdout.contains("STORED BYTES"));
+    assert!(stdout.contains("ORIGINAL BYTES"));
+    assert!(stdout.contains("COMPRESSION"));
     assert!(stdout.contains("SECRET_00"));
     assert!(stdout.contains("SECRET_09"));
     assert!(!stdout.contains("SECRET_10"));

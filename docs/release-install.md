@@ -16,7 +16,7 @@ It currently:
 - downloads `release-metadata.json` from
   `https://raw.githubusercontent.com/runvibe/vaultick/main/release-metadata.json`
 - resolves the latest published version and Linux or macOS binary links
-- detects `amd64` or `arm64`
+- detects `amd64`, `arm64`, or `armv7`
 - installs the `vaultick` CLI under the default user-scoped Vaultick home
 - sets `VAULTICK_HOME`
 - updates shell startup files on Unix-like systems so `~/.vaultick/bin` lands on
@@ -65,6 +65,7 @@ Current link keys are:
 
 - `vaultick_linux_amd64`
 - `vaultick_linux_arm64`
+- `vaultick_linux_armv7`
 - `vaultick_proxy_linux_amd64`
 - `vaultick_proxy_linux_arm64`
 - `vaultick_macos_amd64` when the latest metadata-producing release included
@@ -112,6 +113,8 @@ The manual workflow supports four scopes:
 
 - `linux`: GitHub Release assets for Linux plus repository metadata, Docker, and
   crates.io publishing
+- `armv7`: supplemental GitHub Release asset and repository metadata for
+  32-bit Raspberry Pi OS and similar ARMv7 Linux hosts
 - `mac`: GitHub Release asset for macOS only
 - `windows`: GitHub Release asset for Windows only
 - `all`: Linux full publishing plus macOS and Windows release assets
@@ -129,7 +132,8 @@ Current published assets are:
 - Linux:
   - `vaultick`
   - `vaultick-proxy`
-  - `amd64` and `arm64`
+  - `amd64`, `arm64`, and `armv7` for the CLI
+  - `amd64` and `arm64` for `vaultick-proxy`
 - macOS:
   - `vaultick`
   - `amd64` and `arm64`

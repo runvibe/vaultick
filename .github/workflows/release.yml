@@ -13,6 +13,7 @@ on:
         type: choice
         options:
           - linux
+          - armv7
           - mac
           - windows
           - all
@@ -110,7 +111,8 @@ jobs:
 
           linux_matrix='[
             {"name":"linux-amd64","artifact_name":"release-linux-amd64","runs_on":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","os_slug":"linux","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":true},
-            {"name":"linux-arm64","artifact_name":"release-linux-arm64","runs_on":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","os_slug":"linux","arch_slug":"arm64","exe_ext":"","use_cross":true,"build_proxy":true}
+            {"name":"linux-arm64","artifact_name":"release-linux-arm64","runs_on":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","os_slug":"linux","arch_slug":"arm64","exe_ext":"","use_cross":true,"build_proxy":true},
+            {"name":"linux-armv7","artifact_name":"release-linux-armv7","runs_on":"ubuntu-latest","target":"armv7-unknown-linux-gnueabihf","os_slug":"linux","arch_slug":"armv7","exe_ext":"","use_cross":true,"build_proxy":false}
           ]'
           mac_matrix='[
             {"name":"macos-amd64","artifact_name":"release-macos-amd64","runs_on":"macos-latest","target":"x86_64-apple-darwin","os_slug":"macos","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":false},
@@ -126,6 +128,14 @@ jobs:
               publish_crates=true
               publish_metadata=true
               build_matrix="${linux_matrix}"
+              ;;
+            armv7)
+              publish_docker=false
+              publish_crates=false
+              publish_metadata=true
+              build_matrix='[
+                {"name":"linux-armv7","artifact_name":"release-linux-armv7","runs_on":"ubuntu-latest","target":"armv7-unknown-linux-gnueabihf","os_slug":"linux","arch_slug":"armv7","exe_ext":"","use_cross":true,"build_proxy":false}
+              ]'
               ;;
             mac)
               publish_docker=false
@@ -146,6 +156,7 @@ jobs:
               build_matrix='[
                 {"name":"linux-amd64","artifact_name":"release-linux-amd64","runs_on":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","os_slug":"linux","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":true},
                 {"name":"linux-arm64","artifact_name":"release-linux-arm64","runs_on":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","os_slug":"linux","arch_slug":"arm64","exe_ext":"","use_cross":true,"build_proxy":true},
+                {"name":"linux-armv7","artifact_name":"release-linux-armv7","runs_on":"ubuntu-latest","target":"armv7-unknown-linux-gnueabihf","os_slug":"linux","arch_slug":"armv7","exe_ext":"","use_cross":true,"build_proxy":false},
                 {"name":"macos-amd64","artifact_name":"release-macos-amd64","runs_on":"macos-latest","target":"x86_64-apple-darwin","os_slug":"macos","arch_slug":"amd64","exe_ext":"","use_cross":false,"build_proxy":false},
                 {"name":"macos-arm64","artifact_name":"release-macos-arm64","runs_on":"macos-latest","target":"aarch64-apple-darwin","os_slug":"macos","arch_slug":"arm64","exe_ext":"","use_cross":false,"build_proxy":false},
                 {"name":"windows-amd64","artifact_name":"release-windows-amd64","runs_on":"windows-latest","target":"x86_64-pc-windows-msvc","os_slug":"windows","arch_slug":"amd64","exe_ext":".exe","use_cross":false,"build_proxy":false}

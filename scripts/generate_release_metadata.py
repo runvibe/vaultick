@@ -16,11 +16,12 @@ def main() -> None:
     links = {
         "vaultick_linux_amd64": f"{base_url}/vaultick-linux-amd64",
         "vaultick_linux_arm64": f"{base_url}/vaultick-linux-arm64",
+        "vaultick_linux_armv7": f"{base_url}/vaultick-linux-armv7",
         "vaultick_proxy_linux_amd64": f"{base_url}/vaultick-proxy-linux-amd64",
         "vaultick_proxy_linux_arm64": f"{base_url}/vaultick-proxy-linux-arm64",
     }
 
-    if release_scope == "all":
+    if release_scope in {"all", "armv7"}:
         links["vaultick_macos_amd64"] = f"{base_url}/vaultick-macos-amd64"
         links["vaultick_macos_arm64"] = f"{base_url}/vaultick-macos-arm64"
         links["vaultick_windows_amd64"] = f"{base_url}/vaultick-windows-amd64.exe"

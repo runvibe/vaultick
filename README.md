@@ -98,6 +98,7 @@ but there is not yet a PowerShell installer.
 
 The manual release workflow supports `linux`, `mac`, `windows`, or `all`.
 Linux publishes release assets, repository metadata, Docker image, and crates;
+the supplemental `armv7` scope publishes the 32-bit ARM Linux CLI asset.
 macOS and Windows publish release assets only.
 
 The repo-hosted installer metadata is refreshed by Linux or `all` releases.

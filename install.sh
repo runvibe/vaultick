@@ -145,6 +145,7 @@ detect_platform() {
   case "${arch_name}" in
     x86_64|amd64) ARCH_SLUG="amd64" ;;
     arm64|aarch64) ARCH_SLUG="arm64" ;;
+    armv7|armv7l) ARCH_SLUG="armv7" ;;
     *) fail "Unsupported architecture: ${arch_name}." ;;
   esac
 }

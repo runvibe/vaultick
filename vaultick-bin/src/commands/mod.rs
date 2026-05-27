@@ -223,14 +223,22 @@ struct RequestDataInput {
 }
 
 pub(crate) fn run() -> Result<i32, Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let cli =
+        Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+    if matches!(cli.command, Command::RemoteStdio) {
+        return remote::handle_remote_stdio();
+    }
+
+    if let Some(target) = remote::resolve_remote(cli.remote.as_deref())? {
+        return remote::dispatch_remote(&target, &cli, &raw_args);
+    }
+
     let db_path = resolve_db_path(cli.db)?;
     let vaultick = Vaultick::open(&db_path)?;
 
     match cli.command {
-        Command::RemoteStdio => {
-            return Err(io::Error::other("remote-stdio is not implemented yet").into());
-        }
+        Command::RemoteStdio => unreachable!("remote-stdio is handled before local dispatch"),
         Command::Workspace(command) => handle_workspace(&vaultick, command.command)?,
         Command::Rsa(command) => {
             let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;

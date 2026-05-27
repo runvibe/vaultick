@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::thread;
@@ -101,6 +102,92 @@ impl TestEnv {
             .unwrap();
         assert_success(&output);
     }
+
+    fn fake_ssh_path(&self) -> PathBuf {
+        let path = self.home.join("fake-ssh");
+        fs::write(&path, "#!/bin/sh\nshift\nexec \"$@\"\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+}
+
+#[test]
+fn remote_workspace_list_uses_ssh_stdio_without_local_database() {
+    let env = TestEnv::new();
+    let fake_ssh = env.fake_ssh_path();
+    let mut command = Command::new(binary());
+    command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &format!("fake-host:{}", env.vaultick_home.display()),
+            "workspace",
+            "list",
+        ]);
+
+    let output = command.output().unwrap();
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("workspace"));
+    assert!(stdout.contains("default"));
+}
+
+#[test]
+fn remote_secret_env_file_import_reads_local_file_over_ssh_stdio() {
+    let env = TestEnv::new();
+    let fake_ssh = env.fake_ssh_path();
+    let remote = format!("fake-host:{}", env.vaultick_home.display());
+    let env_file = env.home.join("secrets.env");
+    fs::write(&env_file, "API_TOKEN=from-local-file\n").unwrap();
+
+    let mut rsa_command = Command::new(binary());
+    rsa_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &remote,
+            "rsa",
+            "add",
+            "--label",
+            "id_rsa",
+            "--cert",
+            env.home.join(".ssh").join("id_rsa.pub").to_str().unwrap(),
+        ]);
+    let rsa_output = rsa_command.output().unwrap();
+    assert_success(&rsa_output);
+
+    let mut import_command = Command::new(binary());
+    import_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &remote,
+            "secret",
+            "set",
+            "--env-file",
+            env_file.to_str().unwrap(),
+        ]);
+    let import_output = import_command.output().unwrap();
+    assert_success(&import_output);
+
+    let mut list_command = Command::new(binary());
+    list_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args(["-r", &remote, "secret", "list"]);
+    let list_output = list_command.output().unwrap();
+    assert_success(&list_output);
+    assert!(String::from_utf8_lossy(&list_output.stdout).contains("API_TOKEN"));
 }
 
 #[test]

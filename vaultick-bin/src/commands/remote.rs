@@ -1,5 +1,8 @@
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +13,8 @@ use super::{
 
 const REMOTE_PROTOCOL_VERSION: u32 = 1;
 const FILE_PLACEHOLDER_PREFIX: &str = "__vaultick_remote_file_";
+const VAULTICK_REMOTE_BIN_ENV_VAR: &str = "VAULTICK_REMOTE_BIN";
+const VAULTICK_REMOTE_SSH_COMMAND_ENV_VAR: &str = "VAULTICK_REMOTE_SSH_COMMAND";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteTarget {
@@ -24,12 +29,11 @@ impl RemoteTarget {
             return Err(io::Error::other("missing remote host"));
         }
 
-        let (ssh_destination, vaultick_home) =
-            input
-                .split_once(':')
-                .map_or((input, None), |(destination, home)| {
-                    (destination, Some(home.to_string()))
-                });
+        let (ssh_destination, vaultick_home) = input
+            .split_once(':')
+            .map_or((input, None), |(destination, home)| {
+                (destination, Some(home.to_string()))
+            });
 
         if ssh_destination.trim().is_empty() {
             return Err(io::Error::other("missing remote host"));
@@ -168,6 +172,185 @@ pub(crate) fn prepare_remote_request(
     })
 }
 
+pub(crate) fn dispatch_remote(
+    target: &RemoteTarget,
+    cli: &Cli,
+    raw_args: &[String],
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let mut stdin = io::stdin().lock();
+    let request = prepare_remote_request(target, cli, raw_args, &mut stdin)?;
+    dispatch_remote_request(
+        target,
+        &request,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+pub(crate) fn handle_remote_stdio() -> Result<i32, Box<dyn std::error::Error>> {
+    let mut input = Vec::new();
+    io::stdin().lock().read_to_end(&mut input)?;
+    let request: RemoteRequest = serde_json::from_slice(&input)?;
+    let response = execute_remote_request(request);
+    serde_json::to_writer(io::stdout().lock(), &response)?;
+    Ok(0)
+}
+
+fn dispatch_remote_request(
+    target: &RemoteTarget,
+    request: &RemoteRequest,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let ssh_command =
+        read_env_var(VAULTICK_REMOTE_SSH_COMMAND_ENV_VAR).unwrap_or_else(|| "ssh".to_string());
+    let remote_bin =
+        read_env_var(VAULTICK_REMOTE_BIN_ENV_VAR).unwrap_or_else(|| "vaultick".to_string());
+    let mut child = ProcessCommand::new(&ssh_command)
+        .arg(&target.ssh_destination)
+        .arg(remote_bin)
+        .arg("remote-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to start SSH command for {}: {err}",
+                target.ssh_destination
+            ))
+        })?;
+
+    {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("failed to open SSH stdin"))?;
+        serde_json::to_writer(&mut child_stdin, request)?;
+    }
+
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        stderr.write_all(&output.stderr)?;
+        return Err(io::Error::other(format!(
+            "remote SSH command failed for {} with status {}",
+            target.ssh_destination, output.status
+        ))
+        .into());
+    }
+
+    let response: RemoteResponse = serde_json::from_slice(&output.stdout).map_err(|err| {
+        io::Error::other(format!(
+            "remote command did not return a valid Vaultick response: {err}"
+        ))
+    })?;
+    stdout.write_all(&response.stdout)?;
+    stderr.write_all(&response.stderr)?;
+    Ok(response.exit_code)
+}
+
+fn execute_remote_request(request: RemoteRequest) -> RemoteResponse {
+    match execute_remote_request_inner(request) {
+        Ok(response) => response,
+        Err(err) => RemoteResponse {
+            stdout: Vec::new(),
+            stderr: format!("{err}\n").into_bytes(),
+            exit_code: 1,
+        },
+    }
+}
+
+fn execute_remote_request_inner(
+    request: RemoteRequest,
+) -> Result<RemoteResponse, Box<dyn std::error::Error>> {
+    if request.protocol_version != REMOTE_PROTOCOL_VERSION {
+        return Err(io::Error::other(format!(
+            "unsupported remote protocol version: {}",
+            request.protocol_version
+        ))
+        .into());
+    }
+
+    let mut temp_files = Vec::new();
+    for file in &request.files {
+        temp_files.push(TempFileGuard::write(&file.placeholder, &file.contents)?);
+    }
+
+    let mut args = request.args.clone();
+    for temp_file in &temp_files {
+        for arg in &mut args {
+            if arg.contains(&temp_file.placeholder) {
+                *arg = arg.replace(&temp_file.placeholder, &temp_file.path.to_string_lossy());
+            }
+        }
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let mut child = ProcessCommand::new(current_exe);
+    child.args(&args);
+    child.stdin(Stdio::piped());
+    child.stdout(Stdio::piped());
+    child.stderr(Stdio::piped());
+    child.env_remove(super::VAULTICK_REMOTE_ENV_VAR);
+    if let Some(home) = request.vaultick_home {
+        child.env(super::VAULTICK_HOME_ENV_VAR, home);
+    }
+    if let Some(workspace) = request.workspace {
+        child.env(super::VAULTICK_WORKSPACE_ENV_VAR, workspace);
+    }
+
+    let mut child = child.spawn()?;
+    {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("failed to open remote child stdin"))?;
+        child_stdin.write_all(&request.stdin)?;
+    }
+    let output = child.wait_with_output()?;
+
+    Ok(RemoteResponse {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(1),
+    })
+}
+
+struct TempFileGuard {
+    placeholder: String,
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    fn write(placeholder: &str, contents: &[u8]) -> Result<Self, io::Error> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| io::Error::other(format!("system time error: {err}")))?
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("vaultick-remote-{}-{nonce}", std::process::id()));
+        fs::write(&path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&path)?.permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&path, permissions)?;
+        }
+
+        Ok(Self {
+            placeholder: placeholder.to_string(),
+            path,
+        })
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn capture_file_option(
     args: &mut [String],
     option: &str,
@@ -208,7 +391,11 @@ fn strip_remote_args(raw_args: &[String]) -> Result<Vec<String>, io::Error> {
     Ok(stripped)
 }
 
-fn replace_option_value(args: &mut [String], option: &str, replacement: &str) -> Result<(), io::Error> {
+fn replace_option_value(
+    args: &mut [String],
+    option: &str,
+    replacement: &str,
+) -> Result<(), io::Error> {
     let prefix = format!("{option}=");
 
     for index in 0..args.len() {
@@ -226,7 +413,9 @@ fn replace_option_value(args: &mut [String], option: &str, replacement: &str) ->
         }
     }
 
-    Err(io::Error::other(format!("missing {option} option in remote arguments")))
+    Err(io::Error::other(format!(
+        "missing {option} option in remote arguments"
+    )))
 }
 
 #[cfg(test)]
@@ -280,11 +469,23 @@ mod tests {
             "--file".to_string(),
             secret_file.to_string_lossy().to_string(),
         ];
-        let cli = Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+        let cli =
+            Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
 
-        let request = prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new())).unwrap();
+        let request =
+            prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new()))
+                .unwrap();
 
-        assert_eq!(request.args, vec!["secret", "set", "PAYLOAD", "--file", "__vaultick_remote_file_0__"]);
+        assert_eq!(
+            request.args,
+            vec![
+                "secret",
+                "set",
+                "PAYLOAD",
+                "--file",
+                "__vaultick_remote_file_0__"
+            ]
+        );
         assert_eq!(request.files[0].contents, b"secret-bytes");
     }
 
@@ -301,11 +502,17 @@ mod tests {
             "--env-file".to_string(),
             env_file.to_string_lossy().to_string(),
         ];
-        let cli = Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+        let cli =
+            Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
 
-        let request = prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new())).unwrap();
+        let request =
+            prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new()))
+                .unwrap();
 
-        assert_eq!(request.args, vec!["secret", "set", "--env-file", "__vaultick_remote_file_0__"]);
+        assert_eq!(
+            request.args,
+            vec!["secret", "set", "--env-file", "__vaultick_remote_file_0__"]
+        );
         assert_eq!(request.files[0].contents, b"API_KEY=abc\n");
     }
 
@@ -319,9 +526,16 @@ mod tests {
             "TOKEN".to_string(),
             "--stdin".to_string(),
         ];
-        let cli = Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+        let cli =
+            Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
 
-        let request = prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(b"from-stdin".to_vec())).unwrap();
+        let request = prepare_remote_request(
+            &target(),
+            &cli,
+            &raw_args,
+            &mut Cursor::new(b"from-stdin".to_vec()),
+        )
+        .unwrap();
 
         assert_eq!(request.args, vec!["secret", "set", "TOKEN", "--stdin"]);
         assert_eq!(request.stdin, b"from-stdin");
@@ -336,9 +550,12 @@ mod tests {
             "--".to_string(),
             "env".to_string(),
         ];
-        let cli = Cli::parse_from(std::iter::once("vaultick").chain(exec_args.iter().map(String::as_str)));
+        let cli = Cli::parse_from(
+            std::iter::once("vaultick").chain(exec_args.iter().map(String::as_str)),
+        );
 
-        let err = prepare_remote_request(&target(), &cli, &exec_args, &mut Cursor::new(Vec::new())).unwrap_err();
+        let err = prepare_remote_request(&target(), &cli, &exec_args, &mut Cursor::new(Vec::new()))
+            .unwrap_err();
 
         assert!(err.to_string().contains("workspace, rsa, and secret"));
     }

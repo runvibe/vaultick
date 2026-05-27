@@ -18,6 +18,8 @@ use vaultick_request::{
     parse_request_headers, replace_secret_placeholders, stream_redacted_output,
 };
 
+mod remote;
+
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
 const DEFAULT_DB_FILENAME: &str = "database.db";
@@ -25,6 +27,7 @@ const DEFAULT_DB_FILENAME: &str = "database.db";
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
 const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
 const VAULTICK_WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
+const VAULTICK_REMOTE_ENV_VAR: &str = "VAULTICK_REMOTE";
 
 #[derive(Debug, Clone)]
 struct AutoRsaCandidate {
@@ -41,6 +44,8 @@ struct AutoRsaCandidate {
 struct Cli {
     #[arg(long, value_name = "PATH")]
     db: Option<PathBuf>,
+    #[arg(short = 'r', long, value_name = "ADDRESS")]
+    remote: Option<String>,
     #[arg(long, value_name = "WORKSPACE")]
     workspace: Option<String>,
     #[command(subcommand)]
@@ -59,6 +64,8 @@ enum Command {
     Exec(ExecCommand),
     #[command(about = "Send HTTP requests with vault-backed secret interpolation")]
     Request(RequestCommand),
+    #[command(name = "remote-stdio", hide = true)]
+    RemoteStdio,
 }
 
 #[derive(Subcommand, Debug)]
@@ -221,6 +228,9 @@ pub(crate) fn run() -> Result<i32, Box<dyn std::error::Error>> {
     let vaultick = Vaultick::open(&db_path)?;
 
     match cli.command {
+        Command::RemoteStdio => {
+            return Err(io::Error::other("remote-stdio is not implemented yet").into());
+        }
         Command::Workspace(command) => handle_workspace(&vaultick, command.command)?,
         Command::Rsa(command) => {
             let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
@@ -1414,6 +1424,97 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             err.to_string()
                 .contains("VAULTICK_HOME=\"$HOME/.vaultick\"")
         );
+    }
+
+    #[test]
+    fn remote_flag_parses_short_and_long_forms() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "-r",
+            "assis@192.168.88.240:/mnt/hd/vaultick",
+            "secret",
+            "list",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.remote.as_deref(),
+            Some("assis@192.168.88.240:/mnt/hd/vaultick")
+        );
+
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "--remote",
+            "192.168.88.240",
+            "workspace",
+            "list",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.remote.as_deref(), Some("192.168.88.240"));
+    }
+
+    #[test]
+    fn remote_target_parses_user_host_and_home() {
+        let target = remote::RemoteTarget::parse("assis@192.168.88.240:/mnt/hd/vaultick").unwrap();
+
+        assert_eq!(target.ssh_destination, "assis@192.168.88.240");
+        assert_eq!(target.vaultick_home.as_deref(), Some("/mnt/hd/vaultick"));
+    }
+
+    #[test]
+    fn remote_target_parses_host_without_home() {
+        let target = remote::RemoteTarget::parse("192.168.88.240").unwrap();
+
+        assert_eq!(target.ssh_destination, "192.168.88.240");
+        assert_eq!(target.vaultick_home, None);
+    }
+
+    #[test]
+    fn remote_target_rejects_empty_host() {
+        let err = remote::RemoteTarget::parse(":/mnt/hd/vaultick").unwrap_err();
+
+        assert!(err.to_string().contains("missing remote host"));
+    }
+
+    #[test]
+    fn resolve_remote_prefers_flag_over_env() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var(VAULTICK_REMOTE_ENV_VAR, "env-host:/env/home") };
+
+        let remote = remote::resolve_remote(Some("flag-host:/flag/home")).unwrap();
+
+        assert_eq!(remote.unwrap().ssh_destination, "flag-host");
+        unsafe { std::env::remove_var(VAULTICK_REMOTE_ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_remote_uses_env_when_flag_is_missing() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var(VAULTICK_REMOTE_ENV_VAR, "env-host:/env/home") };
+
+        let remote = remote::resolve_remote(None).unwrap();
+
+        assert_eq!(remote.unwrap().ssh_destination, "env-host");
+        unsafe { std::env::remove_var(VAULTICK_REMOTE_ENV_VAR) };
+    }
+
+    #[test]
+    fn remote_and_db_are_mutually_exclusive() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "--db",
+            "/tmp/vaultick.db",
+            "--remote",
+            "192.168.88.240",
+            "secret",
+            "list",
+        ])
+        .unwrap();
+
+        let err = remote::validate_remote_mode(&cli).unwrap_err();
+
+        assert!(err.to_string().contains("--db cannot be combined"));
     }
 
     #[test]

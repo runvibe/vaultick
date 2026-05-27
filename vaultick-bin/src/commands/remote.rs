@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Cli, Command, RsaSubcommand, SecretSubcommand, VAULTICK_REMOTE_ENV_VAR,
+    Cli, Command, RsaSubcommand, SecretSubcommand, VAULTICK_HOME_ENV_VAR, VAULTICK_REMOTE_ENV_VAR,
     VAULTICK_WORKSPACE_ENV_VAR, read_env_var,
 };
+use vaultick::{Vaultick, compression};
 
 const REMOTE_PROTOCOL_VERSION: u32 = 1;
 const FILE_PLACEHOLDER_PREFIX: &str = "__vaultick_remote_file_";
@@ -76,6 +77,9 @@ pub(crate) struct RemoteRequest {
     pub(crate) workspace: Option<String>,
     pub(crate) stdin: Vec<u8>,
     pub(crate) files: Vec<RemoteFilePayload>,
+    pub(crate) secret_operation: Option<RemoteSecretOperation>,
+    #[serde(skip)]
+    pub(crate) local_output: Option<RemoteLocalOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +93,34 @@ pub(crate) struct RemoteResponse {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
     pub(crate) exit_code: i32,
+    pub(crate) secret_payload: Option<RemoteSecretPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RemoteSecretOperation {
+    SetPreparedFile {
+        key: String,
+        payload: Vec<u8>,
+        compression: String,
+        original_size: Option<u64>,
+        overwrite: bool,
+    },
+    GetRawFile {
+        key: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteLocalOutput {
+    pub(crate) path: String,
+    pub(crate) no_uncompress: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteSecretPayload {
+    pub(crate) payload: Vec<u8>,
+    pub(crate) compression: String,
+    pub(crate) original_size: Option<u64>,
 }
 
 pub(crate) fn prepare_remote_request(
@@ -101,6 +133,8 @@ pub(crate) fn prepare_remote_request(
     let mut args = strip_remote_args(raw_args)?;
     let mut stdin = Vec::new();
     let mut files = Vec::new();
+    let mut secret_operation = None;
+    let mut local_output = None;
 
     match &cli.command {
         Command::Workspace(_) => {}
@@ -109,6 +143,11 @@ pub(crate) fn prepare_remote_request(
                 stdin: read_stdin,
                 file,
                 env_file,
+                key,
+                overwrite,
+                compress,
+                compress_level,
+                no_compress,
                 ..
             } => {
                 if *read_stdin || env_file.as_deref() == Some("-") {
@@ -116,7 +155,22 @@ pub(crate) fn prepare_remote_request(
                 }
 
                 if let Some(path) = file {
-                    capture_file_option(&mut args, "--file", path, &mut files)?;
+                    let key = key.clone().ok_or_else(|| {
+                        io::Error::other("missing secret key or use --env-file")
+                    })?;
+                    let file_contents = fs::read(path)?;
+                    let prepared = compression::prepare_secret_payload(
+                        &file_contents,
+                        super::resolve_compression_mode(*compress, *compress_level, *no_compress)?,
+                    )?;
+                    args.clear();
+                    secret_operation = Some(RemoteSecretOperation::SetPreparedFile {
+                        key,
+                        payload: prepared.payload,
+                        compression: prepared.compression.as_str().to_string(),
+                        original_size: prepared.original_size,
+                        overwrite: *overwrite,
+                    });
                 }
 
                 if let Some(path) = env_file
@@ -125,9 +179,22 @@ pub(crate) fn prepare_remote_request(
                     capture_file_option(&mut args, "--env-file", path, &mut files)?;
                 }
             }
-            SecretSubcommand::Get { .. }
-            | SecretSubcommand::List { .. }
-            | SecretSubcommand::Delete { .. } => {}
+            SecretSubcommand::Get {
+                key,
+                output,
+                no_uncompress,
+                ..
+            } => {
+                if let Some(output) = output {
+                    args.clear();
+                    secret_operation = Some(RemoteSecretOperation::GetRawFile { key: key.clone() });
+                    local_output = Some(RemoteLocalOutput {
+                        path: output.clone(),
+                        no_uncompress: *no_uncompress,
+                    });
+                }
+            }
+            SecretSubcommand::List { .. } | SecretSubcommand::Delete { .. } => {}
         },
         Command::Rsa(command) => match &command.command {
             RsaSubcommand::Add {
@@ -167,6 +234,8 @@ pub(crate) fn prepare_remote_request(
         workspace: read_env_var(VAULTICK_WORKSPACE_ENV_VAR),
         stdin,
         files,
+        secret_operation,
+        local_output,
     })
 }
 
@@ -242,6 +311,26 @@ fn dispatch_remote_request(
             "remote command did not return a valid Vaultick response: {err}"
         ))
     })?;
+    if let Some(secret_payload) = response.secret_payload {
+        let local_output = request.local_output.as_ref().ok_or_else(|| {
+            io::Error::other("remote returned a secret payload without a local output target")
+        })?;
+        let compression = secret_payload
+            .compression
+            .parse::<compression::Compression>()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let payload = if local_output.no_uncompress {
+            secret_payload.payload
+        } else {
+            compression::decompress_secret_payload(
+                &secret_payload.payload,
+                compression,
+                secret_payload.original_size,
+            )
+            .map_err(|err| io::Error::other(err.to_string()))?
+        };
+        fs::write(&local_output.path, payload)?;
+    }
     stdout.write_all(&response.stdout)?;
     stderr.write_all(&response.stderr)?;
     Ok(response.exit_code)
@@ -254,6 +343,7 @@ fn execute_remote_request(request: RemoteRequest) -> RemoteResponse {
             stdout: Vec::new(),
             stderr: format!("{err}\n").into_bytes(),
             exit_code: 1,
+            secret_payload: None,
         },
     }
 }
@@ -267,6 +357,10 @@ fn execute_remote_request_inner(
             request.protocol_version
         ))
         .into());
+    }
+
+    if let Some(operation) = request.secret_operation.clone() {
+        return execute_remote_secret_operation(request, operation);
     }
 
     let mut temp_files = Vec::new();
@@ -311,7 +405,74 @@ fn execute_remote_request_inner(
         stdout: output.stdout,
         stderr: output.stderr,
         exit_code: output.status.code().unwrap_or(1),
+        secret_payload: None,
     })
+}
+
+fn execute_remote_secret_operation(
+    request: RemoteRequest,
+    operation: RemoteSecretOperation,
+) -> Result<RemoteResponse, Box<dyn std::error::Error>> {
+    let db_path = resolve_remote_db_path(request.vaultick_home.as_deref())?;
+    let vaultick = Vaultick::open(db_path)?;
+    let workspace_ref = request
+        .workspace
+        .as_deref()
+        .unwrap_or(super::DEFAULT_WORKSPACE_NAME);
+
+    match operation {
+        RemoteSecretOperation::SetPreparedFile {
+            key,
+            payload,
+            compression,
+            original_size,
+            overwrite,
+        } => {
+            let compression = compression.parse::<compression::Compression>()?;
+            vaultick.set_secret_prepared_bytes(
+                workspace_ref,
+                &key,
+                &payload,
+                compression,
+                original_size,
+                overwrite,
+            )?;
+            Ok(RemoteResponse {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 0,
+                secret_payload: None,
+            })
+        }
+        RemoteSecretOperation::GetRawFile { key } => {
+            let ssh_dir = super::resolve_ssh_dir()?;
+            let raw = vaultick.get_secret_raw_bytes_auto(workspace_ref, &key, ssh_dir)?;
+            Ok(RemoteResponse {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                exit_code: 0,
+                secret_payload: Some(RemoteSecretPayload {
+                    payload: raw.payload,
+                    compression: raw.compression.as_str().to_string(),
+                    original_size: raw.original_size,
+                }),
+            })
+        }
+    }
+}
+
+fn resolve_remote_db_path(vaultick_home: Option<&str>) -> Result<PathBuf, io::Error> {
+    let vaultick_home = match vaultick_home {
+        Some(home) => home.to_string(),
+        None => read_env_var(VAULTICK_HOME_ENV_VAR).ok_or_else(|| {
+            io::Error::other(
+                "missing VAULTICK_HOME. Configure VAULTICK_HOME on the remote host or include :VAULTICK_HOME in --remote",
+            )
+        })?,
+    };
+    let db_directory = PathBuf::from(vaultick_home).join(super::DEFAULT_DB_DIRECTORY);
+    fs::create_dir_all(&db_directory)?;
+    Ok(db_directory.join(super::DEFAULT_DB_FILENAME))
 }
 
 struct TempFileGuard {
@@ -454,10 +615,10 @@ mod tests {
     }
 
     #[test]
-    fn prepare_remote_request_captures_secret_file_payload() {
+    fn prepare_remote_request_prepares_secret_file_payload_on_client() {
         let dir = tempdir().unwrap();
         let secret_file = dir.path().join("secret.bin");
-        fs::write(&secret_file, b"secret-bytes").unwrap();
+        fs::write(&secret_file, b"secret-bytes".repeat(256)).unwrap();
         let raw_args = vec![
             "-r".to_string(),
             "host:/vault".to_string(),
@@ -466,6 +627,7 @@ mod tests {
             "PAYLOAD".to_string(),
             "--file".to_string(),
             secret_file.to_string_lossy().to_string(),
+            "--compress".to_string(),
         ];
         let cli =
             Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
@@ -474,17 +636,54 @@ mod tests {
             prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new()))
                 .unwrap();
 
+        assert!(request.args.is_empty());
+        assert!(request.files.is_empty());
+        let Some(RemoteSecretOperation::SetPreparedFile {
+            key,
+            payload,
+            compression,
+            original_size,
+            overwrite,
+        }) = request.secret_operation
+        else {
+            panic!("expected prepared file operation");
+        };
+        assert_eq!(key, "PAYLOAD");
+        assert_eq!(compression, "zstd");
+        assert_eq!(original_size, Some(b"secret-bytes".repeat(256).len() as u64));
+        assert!(!overwrite);
+        assert!(payload.len() < b"secret-bytes".repeat(256).len());
+    }
+
+    #[test]
+    fn prepare_remote_request_captures_get_output_for_local_write() {
+        let raw_args = vec![
+            "-r".to_string(),
+            "host:/vault".to_string(),
+            "secret".to_string(),
+            "get".to_string(),
+            "PAYLOAD".to_string(),
+            "--output".to_string(),
+            "payload.bin".to_string(),
+            "--no-uncompress".to_string(),
+        ];
+        let cli =
+            Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+
+        let request =
+            prepare_remote_request(&target(), &cli, &raw_args, &mut Cursor::new(Vec::new()))
+                .unwrap();
+
+        assert!(request.args.is_empty());
         assert_eq!(
-            request.args,
-            vec![
-                "secret",
-                "set",
-                "PAYLOAD",
-                "--file",
-                "__vaultick_remote_file_0__"
-            ]
+            request.secret_operation,
+            Some(RemoteSecretOperation::GetRawFile {
+                key: "PAYLOAD".to_string()
+            })
         );
-        assert_eq!(request.files[0].contents, b"secret-bytes");
+        let local_output = request.local_output.unwrap();
+        assert_eq!(local_output.path, "payload.bin");
+        assert!(local_output.no_uncompress);
     }
 
     #[test]

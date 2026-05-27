@@ -191,6 +191,68 @@ fn remote_secret_env_file_import_reads_local_file_over_ssh_stdio() {
 }
 
 #[test]
+fn remote_secret_file_roundtrip_compresses_and_restores_on_client() {
+    let env = TestEnv::new();
+    let fake_ssh = env.fake_ssh_path();
+    let remote = format!("fake-host:{}", env.vaultick_home.display());
+    let input = env.home.join("remote-archive.txt");
+    let output = env.home.join("remote-restored.txt");
+    let payload = b"remote-client-compression\n".repeat(256);
+    fs::write(&input, &payload).unwrap();
+
+    let mut rsa_command = Command::new(binary());
+    rsa_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &remote,
+            "rsa",
+            "add",
+            "--label",
+            "id_rsa",
+            "--cert",
+            env.home.join(".ssh").join("id_rsa.pub").to_str().unwrap(),
+        ]);
+    assert_success(&rsa_command.output().unwrap());
+
+    let mut set_command = Command::new(binary());
+    set_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &remote,
+            "secret",
+            "set",
+            "archive",
+            "--file",
+            input.to_str().unwrap(),
+        ]);
+    assert_success(&set_command.output().unwrap());
+
+    let mut get_command = Command::new(binary());
+    get_command
+        .env("HOME", &env.home)
+        .env("VAULTICK_REMOTE_BIN", binary())
+        .env("VAULTICK_REMOTE_SSH_COMMAND", &fake_ssh)
+        .args([
+            "-r",
+            &remote,
+            "secret",
+            "get",
+            "archive",
+            "--output",
+            output.to_str().unwrap(),
+        ]);
+    assert_success(&get_command.output().unwrap());
+
+    assert_eq!(fs::read(output).unwrap(), payload);
+}
+
+#[test]
 fn secret_set_and_get_metadata_are_case_insensitive_and_store_uppercase() {
     let env = TestEnv::new();
     env.setup_default_rsa();

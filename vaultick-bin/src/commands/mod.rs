@@ -664,7 +664,7 @@ fn resolve_secret_set_request(
     Ok(ResolvedSecretSetRequest::Single { key, input })
 }
 
-fn resolve_compression_mode(
+pub(crate) fn resolve_compression_mode(
     compress: bool,
     compress_level: Option<i32>,
     no_compress: bool,

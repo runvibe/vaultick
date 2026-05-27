@@ -12,11 +12,14 @@ use rsa::pkcs8::{EncodePublicKey, LineEnding};
 use serde::Deserialize;
 use serde_json::json;
 use ssh_key::{HashAlg, PrivateKey as SshPrivateKey, PublicKey as SshPublicKey};
+use vaultick::compression::{self, CompressionMode};
 use vaultick::{Result as VaultickResult, RsaCertificate, SecretMetadata, Vaultick, Workspace};
 use vaultick_request::{
     RequestBody, RequestSpec, RequestTemplateIndex, ResolvedRequest, execute_blocking,
     parse_request_headers, replace_secret_placeholders, stream_redacted_output,
 };
+
+mod remote;
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_DB_DIRECTORY: &str = "databases";
@@ -25,6 +28,8 @@ const DEFAULT_DB_FILENAME: &str = "database.db";
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
 const VAULTICK_HOME_ENV_VAR: &str = "VAULTICK_HOME";
 const VAULTICK_WORKSPACE_ENV_VAR: &str = "VAULTICK_WORKSPACE";
+const VAULTICK_REMOTE_ENV_VAR: &str = "VAULTICK_REMOTE";
+const VAULTICK_COMPRESSION_LEVEL_ENV_VAR: &str = "VAULTICK_COMPRESSION_LEVEL";
 
 #[derive(Debug, Clone)]
 struct AutoRsaCandidate {
@@ -41,6 +46,8 @@ struct AutoRsaCandidate {
 struct Cli {
     #[arg(long, value_name = "PATH")]
     db: Option<PathBuf>,
+    #[arg(short = 'r', long, value_name = "ADDRESS")]
+    remote: Option<String>,
     #[arg(long, value_name = "WORKSPACE")]
     workspace: Option<String>,
     #[command(subcommand)]
@@ -59,6 +66,8 @@ enum Command {
     Exec(ExecCommand),
     #[command(about = "Send HTTP requests with vault-backed secret interpolation")]
     Request(RequestCommand),
+    #[command(name = "remote-stdio", hide = true)]
+    RemoteStdio,
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,12 +131,22 @@ enum SecretSubcommand {
         skip_existing: bool,
         #[arg(long = "env-file", value_name = "PATH")]
         env_file: Option<String>,
+        #[arg(long, default_value_t = false, conflicts_with = "no_compress")]
+        compress: bool,
+        #[arg(long = "compress-level", value_name = "N", value_parser = parse_compression_level, conflicts_with = "no_compress")]
+        compress_level: Option<i32>,
+        #[arg(long = "no-compress", default_value_t = false)]
+        no_compress: bool,
     },
     #[command(about = "Read a secret value")]
     Get {
         key: String,
         #[arg(long, default_value_t = false)]
         json: bool,
+        #[arg(long, value_name = "PATH")]
+        output: Option<String>,
+        #[arg(long = "no-uncompress", default_value_t = false)]
+        no_uncompress: bool,
     },
     #[command(about = "List secrets in the active workspace")]
     List {
@@ -187,6 +206,8 @@ struct RequestCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedSecretSetInput {
     value: Vec<u8>,
+    compression: compression::Compression,
+    original_size: Option<u64>,
     print_output: bool,
 }
 
@@ -199,6 +220,13 @@ enum ResolvedSecretSetRequest {
     EnvFile {
         entries: Vec<(String, String)>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SecretSetCompressionOptions {
+    compress: bool,
+    compress_level: Option<i32>,
+    no_compress: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,11 +244,22 @@ struct RequestDataInput {
 }
 
 pub(crate) fn run() -> Result<i32, Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
+    let cli =
+        Cli::parse_from(std::iter::once("vaultick").chain(raw_args.iter().map(String::as_str)));
+    if matches!(cli.command, Command::RemoteStdio) {
+        return remote::handle_remote_stdio();
+    }
+
+    if let Some(target) = remote::resolve_remote(cli.remote.as_deref())? {
+        return remote::dispatch_remote(&target, &cli, &raw_args);
+    }
+
     let db_path = resolve_db_path(cli.db)?;
     let vaultick = Vaultick::open(&db_path)?;
 
     match cli.command {
+        Command::RemoteStdio => unreachable!("remote-stdio is handled before local dispatch"),
         Command::Workspace(command) => handle_workspace(&vaultick, command.command)?,
         Command::Rsa(command) => {
             let workspace_ref = resolve_workspace_ref(&vaultick, cli.workspace.as_deref())?;
@@ -339,6 +378,9 @@ fn handle_secret(
             overwrite,
             skip_existing,
             env_file,
+            compress,
+            compress_level,
+            no_compress,
         } => {
             let mut stdin_reader = io::stdin().lock();
             let request = resolve_secret_set_request(
@@ -347,6 +389,11 @@ fn handle_secret(
                 stdin,
                 file.as_deref(),
                 env_file.as_deref(),
+                SecretSetCompressionOptions {
+                    compress,
+                    compress_level,
+                    no_compress,
+                },
                 &mut stdin_reader,
             )?;
             match request {
@@ -357,8 +404,14 @@ fn handle_secret(
                         )
                         .into());
                     }
-                    let secret =
-                        vaultick.set_secret_bytes(workspace_ref, &key, &input.value, overwrite)?;
+                    let secret = vaultick.set_secret_prepared_bytes(
+                        workspace_ref,
+                        &key,
+                        &input.value,
+                        input.compression,
+                        input.original_size,
+                        overwrite,
+                    )?;
                     if input.print_output {
                         print_secret_metadata(&secret);
                     }
@@ -399,11 +452,38 @@ fn handle_secret(
                 }
             }
         }
-        SecretSubcommand::Get { key, json } => {
-            let secret = vaultick.get_secret_metadata(workspace_ref, &key)?;
-            if json {
+        SecretSubcommand::Get {
+            key,
+            json,
+            output,
+            no_uncompress,
+        } => {
+            if no_uncompress && output.is_none() {
+                return Err(io::Error::other("--no-uncompress requires --output").into());
+            }
+            if json && output.is_some() {
+                return Err(io::Error::other("--json cannot be combined with --output").into());
+            }
+
+            if let Some(output) = output {
+                let ssh_dir = resolve_ssh_dir().map_err(|_| {
+                    io::Error::other(
+                        "no private key candidate was found automatically; define HOME with .ssh keys",
+                    )
+                })?;
+                let contents = if no_uncompress {
+                    vaultick
+                        .get_secret_raw_bytes_auto(workspace_ref, &key, &ssh_dir)?
+                        .payload
+                } else {
+                    vaultick.get_secret_bytes_auto(workspace_ref, &key, &ssh_dir)?
+                };
+                fs::write(output, contents)?;
+            } else if json {
+                let secret = vaultick.get_secret_metadata(workspace_ref, &key)?;
                 print_secret_metadata_json(&secret)?;
             } else {
+                let secret = vaultick.get_secret_metadata(workspace_ref, &key)?;
                 print_secret_metadata_table(std::slice::from_ref(&secret));
             }
         }
@@ -513,6 +593,8 @@ fn resolve_secret_set_input(
         )),
         (Some(value), false) => Ok(ResolvedSecretSetInput {
             value: value.into_bytes(),
+            compression: compression::Compression::None,
+            original_size: None,
             print_output: false,
         }),
         (None, false) => Err(io::Error::other("missing secret value or use --stdin")),
@@ -521,6 +603,8 @@ fn resolve_secret_set_input(
             reader.read_to_end(&mut value)?;
             Ok(ResolvedSecretSetInput {
                 value,
+                compression: compression::Compression::None,
+                original_size: None,
                 print_output: true,
             })
         }
@@ -533,12 +617,26 @@ fn resolve_secret_set_request(
     stdin: bool,
     file: Option<&str>,
     env_file: Option<&str>,
+    compression_options: SecretSetCompressionOptions,
     reader: &mut impl Read,
 ) -> Result<ResolvedSecretSetRequest, Box<dyn std::error::Error>> {
+    let SecretSetCompressionOptions {
+        compress,
+        compress_level,
+        no_compress,
+    } = compression_options;
+
     if let Some(env_file) = env_file {
-        if key.is_some() || value.is_some() || stdin || file.is_some() {
+        if key.is_some()
+            || value.is_some()
+            || stdin
+            || file.is_some()
+            || compress
+            || compress_level.is_some()
+            || no_compress
+        {
             return Err(io::Error::other(
-                "--env-file cannot be combined with key, value, --stdin, or --file",
+                "--env-file cannot be combined with key, value, --stdin, --file, or compression flags",
             )
             .into());
         }
@@ -556,17 +654,51 @@ fn resolve_secret_set_request(
         }
 
         let value = fs::read(file)?;
+        let prepared = compression::prepare_secret_payload(
+            &value,
+            resolve_compression_mode(compress, compress_level, no_compress)?,
+        )?;
         return Ok(ResolvedSecretSetRequest::Single {
             key,
             input: ResolvedSecretSetInput {
-                value,
+                value: prepared.payload,
+                compression: prepared.compression,
+                original_size: prepared.original_size,
                 print_output: false,
             },
         });
     }
 
+    if compress || compress_level.is_some() || no_compress {
+        return Err(io::Error::other("compression flags can only be used with --file").into());
+    }
+
     let input = resolve_secret_set_input(value, stdin, reader)?;
     Ok(ResolvedSecretSetRequest::Single { key, input })
+}
+
+pub(crate) fn resolve_compression_mode(
+    compress: bool,
+    compress_level: Option<i32>,
+    no_compress: bool,
+) -> Result<CompressionMode, io::Error> {
+    if no_compress {
+        return Ok(CompressionMode::None);
+    }
+
+    let level = match compress_level {
+        Some(level) => level,
+        None => match read_env_var(VAULTICK_COMPRESSION_LEVEL_ENV_VAR) {
+            Some(value) => parse_compression_level(&value).map_err(io::Error::other)?,
+            None => compression::DEFAULT_COMPRESSION_LEVEL,
+        },
+    };
+
+    if compress {
+        Ok(CompressionMode::Force { level })
+    } else {
+        Ok(CompressionMode::Try { level })
+    }
 }
 
 fn read_env_file_source(path: &str, reader: &mut impl Read) -> Result<String, io::Error> {
@@ -653,6 +785,13 @@ fn parse_positive_usize(input: &str) -> Result<usize, String> {
     }
 
     Ok(value)
+}
+
+fn parse_compression_level(input: &str) -> Result<i32, String> {
+    let level = input
+        .parse::<i32>()
+        .map_err(|_| "invalid compression level: expected 1..=22".to_string())?;
+    compression::validate_level(level).map_err(|err| err.to_string())
 }
 
 fn resolve_and_get_secret(
@@ -1417,6 +1556,97 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     }
 
     #[test]
+    fn remote_flag_parses_short_and_long_forms() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "-r",
+            "assis@192.168.88.240:/mnt/hd/vaultick",
+            "secret",
+            "list",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.remote.as_deref(),
+            Some("assis@192.168.88.240:/mnt/hd/vaultick")
+        );
+
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "--remote",
+            "192.168.88.240",
+            "workspace",
+            "list",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.remote.as_deref(), Some("192.168.88.240"));
+    }
+
+    #[test]
+    fn remote_target_parses_user_host_and_home() {
+        let target = remote::RemoteTarget::parse("assis@192.168.88.240:/mnt/hd/vaultick").unwrap();
+
+        assert_eq!(target.ssh_destination, "assis@192.168.88.240");
+        assert_eq!(target.vaultick_home.as_deref(), Some("/mnt/hd/vaultick"));
+    }
+
+    #[test]
+    fn remote_target_parses_host_without_home() {
+        let target = remote::RemoteTarget::parse("192.168.88.240").unwrap();
+
+        assert_eq!(target.ssh_destination, "192.168.88.240");
+        assert_eq!(target.vaultick_home, None);
+    }
+
+    #[test]
+    fn remote_target_rejects_empty_host() {
+        let err = remote::RemoteTarget::parse(":/mnt/hd/vaultick").unwrap_err();
+
+        assert!(err.to_string().contains("missing remote host"));
+    }
+
+    #[test]
+    fn resolve_remote_prefers_flag_over_env() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var(VAULTICK_REMOTE_ENV_VAR, "env-host:/env/home") };
+
+        let remote = remote::resolve_remote(Some("flag-host:/flag/home")).unwrap();
+
+        assert_eq!(remote.unwrap().ssh_destination, "flag-host");
+        unsafe { std::env::remove_var(VAULTICK_REMOTE_ENV_VAR) };
+    }
+
+    #[test]
+    fn resolve_remote_uses_env_when_flag_is_missing() {
+        let _guard = env_lock().lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var(VAULTICK_REMOTE_ENV_VAR, "env-host:/env/home") };
+
+        let remote = remote::resolve_remote(None).unwrap();
+
+        assert_eq!(remote.unwrap().ssh_destination, "env-host");
+        unsafe { std::env::remove_var(VAULTICK_REMOTE_ENV_VAR) };
+    }
+
+    #[test]
+    fn remote_and_db_are_mutually_exclusive() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "--db",
+            "/tmp/vaultick.db",
+            "--remote",
+            "192.168.88.240",
+            "secret",
+            "list",
+        ])
+        .unwrap();
+
+        let err = remote::validate_remote_mode(&cli).unwrap_err();
+
+        assert!(err.to_string().contains("--db cannot be combined"));
+    }
+
+    #[test]
     fn normalize_public_material_converts_openssh_rsa_key_to_pem() {
         let normalized = normalize_public_material(SSH_RSA_PUBLIC).unwrap();
 
@@ -1740,6 +1970,8 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             resolved,
             ResolvedSecretSetInput {
                 value: b"token-value".to_vec(),
+                compression: compression::Compression::None,
+                original_size: None,
                 print_output: false,
             }
         );
@@ -1755,6 +1987,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             Some("-"),
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(
                 b"github_token=ghp_123\nexport aws_access_key_id=\"AKIA123\"\n".to_vec(),
             ),
@@ -1777,6 +2014,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             Some(".env"),
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut reader,
         )
         .unwrap_err();
@@ -1816,12 +2058,74 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
     }
 
     #[test]
+    fn secret_set_file_parses_compression_flags() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "secret",
+            "set",
+            "ARCHIVE",
+            "--file",
+            "archive.tar",
+            "--compress",
+            "--compress-level",
+            "22",
+        ])
+        .unwrap();
+
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretSubcommand::Set {
+            compress,
+            compress_level,
+            no_compress,
+            ..
+        } = command.command
+        else {
+            panic!("expected secret set command");
+        };
+
+        assert!(compress);
+        assert_eq!(compress_level, Some(22));
+        assert!(!no_compress);
+    }
+
+    #[test]
+    fn secret_get_parses_output_and_raw_payload_flags() {
+        let cli = Cli::try_parse_from([
+            "vaultick",
+            "secret",
+            "get",
+            "ARCHIVE",
+            "--output",
+            "archive.tar",
+            "--no-uncompress",
+        ])
+        .unwrap();
+
+        let Command::Secret(command) = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretSubcommand::Get {
+            output,
+            no_uncompress,
+            ..
+        } = command.command
+        else {
+            panic!("expected secret get command");
+        };
+
+        assert_eq!(output, Some("archive.tar".to_string()));
+        assert!(no_uncompress);
+    }
+
+    #[test]
     fn secret_get_and_list_parse_json_flag() {
         let cli = Cli::try_parse_from(["vaultick", "secret", "get", "API_KEY", "--json"]).unwrap();
         let Command::Secret(command) = cli.command else {
             panic!("expected secret command");
         };
-        let SecretSubcommand::Get { key, json } = command.command else {
+        let SecretSubcommand::Get { key, json, .. } = command.command else {
             panic!("expected secret get command");
         };
         assert_eq!(key, "API_KEY");
@@ -1879,6 +2183,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             None,
             None,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap();
@@ -1889,6 +2198,8 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
                 key: "GOOGLE_TOKEN".to_string(),
                 input: ResolvedSecretSetInput {
                     value: b"token-value".to_vec(),
+                    compression: compression::Compression::None,
+                    original_size: None,
                     print_output: false,
                 }
             }
@@ -1907,6 +2218,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             Some(path.to_str().unwrap()),
             None,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: true,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap();
@@ -1917,6 +2233,8 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
                 key: "TOKEN".to_string(),
                 input: ResolvedSecretSetInput {
                     value: vec![0x00, 0x7f, 0xff, 0x41],
+                    compression: compression::Compression::None,
+                    original_size: None,
                     print_output: false,
                 }
             }
@@ -1931,6 +2249,11 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             false,
             Some("secret.txt"),
             None,
+            SecretSetCompressionOptions {
+                compress: false,
+                compress_level: None,
+                no_compress: false,
+            },
             &mut std::io::Cursor::new(Vec::<u8>::new()),
         )
         .unwrap_err();
@@ -1971,6 +2294,8 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             resolved,
             ResolvedSecretSetInput {
                 value: b"token-from-stdin".to_vec(),
+                compression: compression::Compression::None,
+                original_size: None,
                 print_output: true,
             }
         );

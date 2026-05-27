@@ -20,6 +20,8 @@ use x509_parser::nom::AsBytes;
 use x509_parser::pem::parse_x509_pem;
 use x509_parser::prelude::FromDer;
 
+pub mod compression;
+
 const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
@@ -85,6 +87,8 @@ struct SecretRecord {
     metadata: SecretMetadata,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
+    compression: compression::Compression,
+    original_size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -286,6 +290,26 @@ impl Vaultick {
         value: &[u8],
         overwrite: bool,
     ) -> Result<SecretMetadata> {
+        self.set_secret_prepared_bytes(
+            workspace_ref,
+            key,
+            value,
+            compression::Compression::None,
+            None,
+            overwrite,
+        )
+    }
+
+    pub fn set_secret_prepared_bytes(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        value: &[u8],
+        compression: compression::Compression,
+        original_size: Option<u64>,
+        overwrite: bool,
+    ) -> Result<SecretMetadata> {
+        validate_compression_metadata(compression, original_size)?;
         let key = normalize_secret_key(key)?;
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
@@ -344,9 +368,19 @@ impl Vaultick {
                 "UPDATE secrets
                  SET nonce = ?1,
                      ciphertext = ?2,
+                     compression = ?3,
+                     original_size = ?4,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                 WHERE id = ?3",
-                params![nonce.to_vec(), ciphertext, secret_id],
+                 WHERE id = ?5",
+                params![
+                    nonce.to_vec(),
+                    ciphertext,
+                    compression.as_str(),
+                    original_size.map(i64::try_from).transpose().map_err(|_| {
+                        VaultickError::Validation("original_size is too large".to_string())
+                    })?,
+                    secret_id
+                ],
             )?;
             tx.execute(
                 "DELETE FROM secret_recipients WHERE secret_id = ?1",
@@ -354,9 +388,19 @@ impl Vaultick {
             )?;
         } else {
             tx.execute(
-                "INSERT INTO secrets (id, workspace_id, key, nonce, ciphertext)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![secret_id, workspace.id, key, nonce.to_vec(), ciphertext],
+                "INSERT INTO secrets (id, workspace_id, key, nonce, ciphertext, compression, original_size)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    secret_id,
+                    workspace.id,
+                    key,
+                    nonce.to_vec(),
+                    ciphertext,
+                    compression.as_str(),
+                    original_size.map(i64::try_from).transpose().map_err(|_| {
+                        VaultickError::Validation("original_size is too large".to_string())
+                    })?
+                ],
             )
             .map_err(|err| {
                 map_constraint(
@@ -398,6 +442,18 @@ impl Vaultick {
     ) -> Result<Vec<u8>> {
         let private_key = parse_private_key(private_key_pem)?;
         let key = normalize_secret_key(key)?;
+        let raw = self.decrypt_secret_with_private_key(workspace_ref, &key, &private_key)?;
+        compression::decompress_secret_payload(&raw.payload, raw.compression, raw.original_size)
+    }
+
+    pub fn get_secret_raw_bytes(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        private_key_pem: &str,
+    ) -> Result<compression::RawSecretBytes> {
+        let private_key = parse_private_key(private_key_pem)?;
+        let key = normalize_secret_key(key)?;
         self.decrypt_secret_with_private_key(workspace_ref, &key, &private_key)
     }
 
@@ -412,6 +468,28 @@ impl Vaultick {
         self.get_secret(workspace_ref, key, &private_key_pem)
     }
 
+    pub fn get_secret_bytes_auto<P: AsRef<Path>>(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        ssh_dir: P,
+    ) -> Result<Vec<u8>> {
+        let private_key_pem =
+            self.resolve_auto_private_key_pem_for_workspace(workspace_ref, ssh_dir)?;
+        self.get_secret_bytes(workspace_ref, key, &private_key_pem)
+    }
+
+    pub fn get_secret_raw_bytes_auto<P: AsRef<Path>>(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        ssh_dir: P,
+    ) -> Result<compression::RawSecretBytes> {
+        let private_key_pem =
+            self.resolve_auto_private_key_pem_for_workspace(workspace_ref, ssh_dir)?;
+        self.get_secret_raw_bytes(workspace_ref, key, &private_key_pem)
+    }
+
     pub fn get_secret_metadata(&self, workspace_ref: &str, key: &str) -> Result<SecretMetadata> {
         let key = normalize_secret_key(key)?;
         let conn = self.conn.borrow();
@@ -424,7 +502,7 @@ impl Vaultick {
         workspace_ref: &str,
         key: &str,
         private_key: &RsaPrivateKey,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<compression::RawSecretBytes> {
         let conn = self.conn.borrow();
         let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
         let secret = Self::find_secret_by_key(&conn, &workspace.id, key)?.ok_or_else(|| {
@@ -438,7 +516,7 @@ impl Vaultick {
 
         let cipher = Aes256Gcm::new_from_slice(&dek)
             .map_err(|err| VaultickError::Crypto(format!("invalid data encryption key: {err}")))?;
-        let plaintext = cipher
+        let payload = cipher
             .decrypt(
                 Nonce::from_slice(secret.nonce.as_slice()),
                 Payload {
@@ -447,7 +525,11 @@ impl Vaultick {
                 },
             )
             .map_err(|err| VaultickError::Crypto(format!("failed to decrypt secret: {err}")))?;
-        Ok(plaintext)
+        Ok(compression::RawSecretBytes {
+            payload,
+            compression: secret.compression,
+            original_size: secret.original_size,
+        })
     }
 
     fn resolve_auto_private_key_pem_for_workspace<P: AsRef<Path>>(
@@ -668,7 +750,7 @@ impl Vaultick {
         key: &str,
     ) -> Result<Option<SecretRecord>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, nonce, ciphertext, created_at, updated_at
+            "SELECT id, workspace_id, key, nonce, ciphertext, compression, original_size, created_at, updated_at
              FROM secrets
              WHERE workspace_id = ?1 AND key = ?2
              LIMIT 1",
@@ -683,7 +765,7 @@ impl Vaultick {
         workspace_id: &str,
     ) -> Result<Vec<SecretRecord>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, nonce, ciphertext, created_at, updated_at
+            "SELECT id, workspace_id, key, nonce, ciphertext, compression, original_size, created_at, updated_at
              FROM secrets
              WHERE workspace_id = ?1
              ORDER BY key ASC",
@@ -739,17 +821,58 @@ fn secret_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<SecretMetadata> {
 }
 
 fn secret_record_from_row(row: &Row<'_>) -> rusqlite::Result<SecretRecord> {
+    let compression: String = row.get(5)?;
+    let compression = compression
+        .parse::<compression::Compression>()
+        .map_err(|err| match err {
+            VaultickError::Validation(message) => rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                Box::new(std::io::Error::other(message)),
+            ),
+            other => rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                Box::new(std::io::Error::other(other.to_string())),
+            ),
+        })?;
+    let original_size: Option<i64> = row.get(6)?;
+    let original_size = original_size
+        .map(u64::try_from)
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(err))
+        })?;
+
     Ok(SecretRecord {
         metadata: SecretMetadata {
             id: row.get(0)?,
             workspace_id: row.get(1)?,
             key: row.get(2)?,
-            created_at: row.get(5)?,
-            updated_at: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
         },
         nonce: row.get(3)?,
         ciphertext: row.get(4)?,
+        compression,
+        original_size,
     })
+}
+
+fn validate_compression_metadata(
+    compression: compression::Compression,
+    original_size: Option<u64>,
+) -> Result<()> {
+    match (compression, original_size) {
+        (compression::Compression::None, None) => Ok(()),
+        (compression::Compression::None, Some(_)) => Err(VaultickError::Validation(
+            "original_size must be empty when compression is none".to_string(),
+        )),
+        (compression::Compression::Zstd, Some(_)) => Ok(()),
+        (compression::Compression::Zstd, None) => Err(VaultickError::Validation(
+            "original_size is required when compression is zstd".to_string(),
+        )),
+    }
 }
 
 fn parse_public_material(input: &str) -> Result<ParsedCertificate> {
@@ -1129,7 +1252,7 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
 
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -1397,6 +1520,76 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert!(
             matches!(err, VaultickError::Crypto(message) if message.contains("not valid UTF-8"))
         );
+    }
+
+    #[test]
+    fn compressed_secret_bytes_roundtrip_to_original_bytes() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        let payload =
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".repeat(32);
+        let prepared = compression::prepare_secret_payload(
+            &payload,
+            compression::CompressionMode::Try { level: 10 },
+        )
+        .unwrap();
+        assert_eq!(prepared.compression, compression::Compression::Zstd);
+
+        store
+            .set_secret_prepared_bytes(
+                "team-a",
+                "archive",
+                &prepared.payload,
+                prepared.compression,
+                prepared.original_size,
+                false,
+            )
+            .unwrap();
+
+        let decrypted = store.get_secret_bytes("team-a", "archive", KEY_1).unwrap();
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn raw_secret_bytes_return_stored_payload_without_decompression() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        let payload = b"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(64);
+        let prepared = compression::prepare_secret_payload(
+            &payload,
+            compression::CompressionMode::Force { level: 10 },
+        )
+        .unwrap();
+
+        store
+            .set_secret_prepared_bytes(
+                "team-a",
+                "archive",
+                &prepared.payload,
+                prepared.compression,
+                prepared.original_size,
+                false,
+            )
+            .unwrap();
+
+        let raw = store
+            .get_secret_raw_bytes("team-a", "archive", KEY_1)
+            .unwrap();
+        assert_eq!(raw.payload, prepared.payload);
+        assert_eq!(raw.compression, compression::Compression::Zstd);
+    }
+
+    #[test]
+    fn compression_level_rejects_out_of_range_values() {
+        let err = compression::validate_level(23).unwrap_err();
+
+        assert!(err.to_string().contains("expected 1..=22"));
     }
 
     #[test]

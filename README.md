@@ -87,11 +87,11 @@ In practice:
 Install the CLI with the public installer:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudvibedev/vaultick/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/runvibe/vaultick/main/install.sh | sh
 ```
 
-Today this installer targets the published Linux `vaultick` binary and configures
-`VAULTICK_HOME="$HOME/.vaultick"`.
+Today this installer targets the published Linux and macOS `vaultick` binaries
+and configures `VAULTICK_HOME="$HOME/.vaultick"`.
 
 On Windows, the release workflow publishes `vaultick.exe` on GitHub Releases,
 but there is not yet a PowerShell installer.

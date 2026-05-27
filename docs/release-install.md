@@ -8,23 +8,23 @@ how the public installer works from the operator point of view.
 The public installer is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cloudvibedev/vaultick/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/runvibe/vaultick/main/install.sh | sh
 ```
 
 It currently:
 
 - downloads `release-metadata.json` from
-  `https://raw.githubusercontent.com/cloudvibedev/vaultick/main/release-metadata.json`
-- resolves the latest published version and Linux binary links
+  `https://raw.githubusercontent.com/runvibe/vaultick/main/release-metadata.json`
+- resolves the latest published version and Linux or macOS binary links
 - detects `amd64` or `arm64`
 - installs the `vaultick` CLI under the default user-scoped Vaultick home
 - sets `VAULTICK_HOME`
 - updates shell startup files on Unix-like systems so `~/.vaultick/bin` lands on
   `PATH`
 
-At this stage the installer is Linux-only. The release workflow can also publish
-macOS and Windows CLI assets on GitHub Releases, but there is not yet a
-PowerShell installer and the public installer does not target macOS.
+At this stage the installer supports Linux and macOS. The release workflow can
+also publish Windows CLI assets on GitHub Releases, but there is not yet a
+PowerShell installer.
 
 ## What Gets Installed
 
@@ -53,7 +53,7 @@ VAULTICK_HOME/databases/database.db
 The release workflow updates a metadata file in the repository at:
 
 ```text
-https://raw.githubusercontent.com/cloudvibedev/vaultick/main/release-metadata.json
+https://raw.githubusercontent.com/runvibe/vaultick/main/release-metadata.json
 ```
 
 That metadata file contains:
@@ -69,18 +69,20 @@ Current link keys are:
 - `vaultick_proxy_linux_arm64`
 - `vaultick_macos_amd64` when the latest metadata-producing release included
   macOS assets
+- `vaultick_macos_arm64` when the latest metadata-producing release included
+  macOS assets
 - `vaultick_windows_amd64` when the latest metadata-producing release included
   Windows assets
 
 The installer currently consumes only the `vaultick_*` CLI entries.
-Because the installer is Linux-only, this metadata file is updated only when the
-release scope includes Linux.
+This metadata file is updated only when the release scope includes Linux,
+because Linux scopes also publish the repository metadata used by the installer.
 
 ## Docker Images
 
 The release workflow also publishes the proxy image to GHCR:
 
-- `ghcr.io/cloudvibedev/vaultick-proxy`
+- `ghcr.io/runvibe/vaultick-proxy`
 
 These tags are published:
 
@@ -130,7 +132,7 @@ Current published assets are:
   - `amd64` and `arm64`
 - macOS:
   - `vaultick`
-  - `amd64`
+  - `amd64` and `arm64`
 - Windows:
   - `vaultick.exe`
   - `amd64`

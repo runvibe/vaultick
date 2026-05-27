@@ -9,9 +9,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1-alpha.2"
+version = "0.0.1-alpha.3"
 license = "MIT"
-repository = "https://github.com/cloudvibedev/vaultick"
+repository = "https://github.com/runvibe/vaultick"
 edition = "2024"
 rust-version = "1.93"
 authors = ["Philippe Assis <codephi@gmail.com>"]
@@ -36,5 +36,5 @@ tempfile = "3"
 thiserror = "2.0"
 tokio = "1"
 uuid = { version = "1.23.0", features = ["v4"] }
-vaultick = { version = "0.0.1-alpha.2", path = "vaultick-lib" }
-vaultick-request = { version = "0.0.1-alpha.2", path = "vaultick-request" }
+vaultick = { version = "0.0.1-alpha.3", path = "vaultick-lib" }
+vaultick-request = { version = "0.0.1-alpha.3", path = "vaultick-request" }

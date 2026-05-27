@@ -1,9 +1,9 @@
 {
   "links": {
-    "vaultick_linux_amd64": "https://github.com/cloudvibedev/vaultick/releases/download/v0.0.1-alpha.2/vaultick-linux-amd64",
-    "vaultick_linux_arm64": "https://github.com/cloudvibedev/vaultick/releases/download/v0.0.1-alpha.2/vaultick-linux-arm64",
-    "vaultick_proxy_linux_amd64": "https://github.com/cloudvibedev/vaultick/releases/download/v0.0.1-alpha.2/vaultick-proxy-linux-amd64",
-    "vaultick_proxy_linux_arm64": "https://github.com/cloudvibedev/vaultick/releases/download/v0.0.1-alpha.2/vaultick-proxy-linux-arm64"
+    "vaultick_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.2/vaultick-linux-amd64",
+    "vaultick_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.2/vaultick-linux-arm64",
+    "vaultick_proxy_linux_amd64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.2/vaultick-proxy-linux-amd64",
+    "vaultick_proxy_linux_arm64": "https://github.com/runvibe/vaultick/releases/download/v0.0.1-alpha.2/vaultick-proxy-linux-arm64"
   },
   "name": "vaultick",
   "published_at": "2026-04-02T09:18:47Z",

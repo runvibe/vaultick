@@ -2,8 +2,8 @@
 
 set -eu
 
-MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/cloudvibedev/vaultick/main/release-metadata.json}"
-VAULTICK_RELEASE_BASE_URL="${VAULTICK_RELEASE_BASE_URL:-https://github.com/cloudvibedev/vaultick/releases/download}"
+MANIFEST_URL="${MANIFEST_URL:-https://raw.githubusercontent.com/runvibe/vaultick/main/release-metadata.json}"
+VAULTICK_RELEASE_BASE_URL="${VAULTICK_RELEASE_BASE_URL:-https://github.com/runvibe/vaultick/releases/download}"
 VAULTICK_HOME_DEFAULT="${HOME}/.vaultick"
 VAULTICK_BIN_DIR="${VAULTICK_HOME_DEFAULT}/bin"
 RC_BEGIN="# >>> Vaultick installer >>>"
@@ -136,8 +136,9 @@ detect_platform() {
 
   case "${os_name}" in
     Linux) OS_SLUG="linux" ;;
+    Darwin) OS_SLUG="macos" ;;
     *)
-      fail "Unsupported operating system: ${os_name}. Vaultick installer currently supports published Linux binaries only."
+      fail "Unsupported operating system: ${os_name}. Vaultick installer currently supports published Linux and macOS binaries only."
       ;;
   esac
 

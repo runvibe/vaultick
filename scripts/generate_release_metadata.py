@@ -22,6 +22,7 @@ def main() -> None:
 
     if release_scope == "all":
         links["vaultick_macos_amd64"] = f"{base_url}/vaultick-macos-amd64"
+        links["vaultick_macos_arm64"] = f"{base_url}/vaultick-macos-arm64"
         links["vaultick_windows_amd64"] = f"{base_url}/vaultick-windows-amd64.exe"
 
     payload = {

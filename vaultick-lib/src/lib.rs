@@ -27,6 +27,7 @@ const INITIAL_SCHEMA: &str = include_str!("../migrations/0001_initial.sql");
 
 const DEFAULT_WORKSPACE_NAME: &str = "default";
 const DEFAULT_SSH_PRIVATE_KEY_NAME: &str = "id_rsa";
+const AES_GCM_TAG_BYTES: u64 = 16;
 
 pub type Result<T> = std::result::Result<T, VaultickError>;
 
@@ -52,6 +53,9 @@ pub struct SecretMetadata {
     pub id: String,
     pub workspace_id: String,
     pub key: String,
+    pub stored_bytes: u64,
+    pub original_bytes: u64,
+    pub compression: compression::Compression,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -638,7 +642,7 @@ impl Vaultick {
         let conn = self.conn.borrow();
         let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, created_at, updated_at
+            "SELECT id, workspace_id, key, created_at, updated_at, compression, original_size, length(ciphertext)
              FROM secrets
              WHERE workspace_id = ?1
              ORDER BY key ASC",
@@ -657,7 +661,7 @@ impl Vaultick {
         let conn = self.conn.borrow();
         let workspace = Self::resolve_workspace(&conn, workspace_ref)?;
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, created_at, updated_at
+            "SELECT id, workspace_id, key, created_at, updated_at, compression, original_size, length(ciphertext)
              FROM secrets
              WHERE workspace_id = ?1
              ORDER BY key ASC
@@ -755,7 +759,7 @@ impl Vaultick {
         key: &str,
     ) -> Result<SecretMetadata> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, created_at, updated_at
+            "SELECT id, workspace_id, key, created_at, updated_at, compression, original_size, length(ciphertext)
              FROM secrets
              WHERE workspace_id = ?1 AND key = ?2
              LIMIT 1",
@@ -805,7 +809,7 @@ impl Vaultick {
         key: &str,
     ) -> Result<Option<SecretMetadata>> {
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, key, created_at, updated_at
+            "SELECT id, workspace_id, key, created_at, updated_at, compression, original_size, length(ciphertext)
              FROM secrets
              WHERE workspace_id = ?1 AND key = ?2
              LIMIT 1",
@@ -866,51 +870,106 @@ fn certificate_from_row(row: &Row<'_>) -> rusqlite::Result<RsaCertificate> {
 }
 
 fn secret_metadata_from_row(row: &Row<'_>) -> rusqlite::Result<SecretMetadata> {
+    let compression = compression_from_row(row, 5)?;
+    let original_size = optional_u64_from_row(row, 6, Type::Integer)?;
+    let stored_bytes = u64_from_row(row, 7, Type::Integer)?;
+    let original_bytes = match compression {
+        compression::Compression::None => stored_bytes.saturating_sub(AES_GCM_TAG_BYTES),
+        compression::Compression::Zstd => original_size.ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Integer,
+                Box::new(std::io::Error::other(
+                    "original_size is required when compression is zstd",
+                )),
+            )
+        })?,
+    };
+
     Ok(SecretMetadata {
         id: row.get(0)?,
         workspace_id: row.get(1)?,
         key: row.get(2)?,
+        stored_bytes,
+        original_bytes,
+        compression,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
     })
 }
 
 fn secret_record_from_row(row: &Row<'_>) -> rusqlite::Result<SecretRecord> {
-    let compression: String = row.get(5)?;
-    let compression = compression
-        .parse::<compression::Compression>()
-        .map_err(|err| match err {
-            VaultickError::Validation(message) => rusqlite::Error::FromSqlConversionFailure(
-                5,
-                Type::Text,
-                Box::new(std::io::Error::other(message)),
-            ),
-            other => rusqlite::Error::FromSqlConversionFailure(
-                5,
-                Type::Text,
-                Box::new(std::io::Error::other(other.to_string())),
-            ),
-        })?;
-    let original_size: Option<i64> = row.get(6)?;
-    let original_size = original_size
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(err))
-        })?;
+    let compression = compression_from_row(row, 5)?;
+    let original_size = optional_u64_from_row(row, 6, Type::Integer)?;
+    let ciphertext: Vec<u8> = row.get(4)?;
+    let stored_bytes = ciphertext.len() as u64;
+    let original_bytes = match compression {
+        compression::Compression::None => stored_bytes.saturating_sub(AES_GCM_TAG_BYTES),
+        compression::Compression::Zstd => original_size.ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                Type::Integer,
+                Box::new(std::io::Error::other(
+                    "original_size is required when compression is zstd",
+                )),
+            )
+        })?,
+    };
 
     Ok(SecretRecord {
         metadata: SecretMetadata {
             id: row.get(0)?,
             workspace_id: row.get(1)?,
             key: row.get(2)?,
+            stored_bytes,
+            original_bytes,
+            compression,
             created_at: row.get(7)?,
             updated_at: row.get(8)?,
         },
         nonce: row.get(3)?,
-        ciphertext: row.get(4)?,
+        ciphertext,
         compression,
         original_size,
+    })
+}
+
+fn compression_from_row(
+    row: &Row<'_>,
+    column: usize,
+) -> rusqlite::Result<compression::Compression> {
+    let compression: String = row.get(column)?;
+    compression
+        .parse::<compression::Compression>()
+        .map_err(|err| match err {
+            VaultickError::Validation(message) => rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Text,
+                Box::new(std::io::Error::other(message)),
+            ),
+            other => rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Text,
+                Box::new(std::io::Error::other(other.to_string())),
+            ),
+        })
+}
+
+fn optional_u64_from_row(
+    row: &Row<'_>,
+    column: usize,
+    column_type: Type,
+) -> rusqlite::Result<Option<u64>> {
+    let value: Option<i64> = row.get(column)?;
+    value.map(u64::try_from).transpose().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(column, column_type, Box::new(err))
+    })
+}
+
+fn u64_from_row(row: &Row<'_>, column: usize, column_type: Type) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(column)?;
+    u64::try_from(value).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(column, column_type, Box::new(err))
     })
 }
 
@@ -1492,6 +1551,9 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.workspace_id, created.workspace_id);
         assert_eq!(fetched.key, "API-KEY");
+        assert_eq!(fetched.stored_bytes, 24);
+        assert_eq!(fetched.original_bytes, 8);
+        assert_eq!(fetched.compression, compression::Compression::None);
         assert_eq!(fetched.created_at, created.created_at);
         assert_eq!(fetched.updated_at, created.updated_at);
     }

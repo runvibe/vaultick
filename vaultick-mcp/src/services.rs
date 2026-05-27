@@ -18,10 +18,10 @@ use vaultick_request::{AsyncClient, BoxError};
 
 use crate::models::{
     AppState, DEFAULT_DB_DIRECTORY, DEFAULT_DB_FILENAME, DEFAULT_LISTEN_ADDR,
-    DEFAULT_PROTOCOL_VERSION, DEFAULT_WORKSPACE_NAME, JsonRpcError, JsonRpcRequest,
-    JsonRpcResponse, KEEPALIVE_INTERVAL, LogLevel, LoggingNotificationParams, MCP_PROTOCOL_HEADER,
-    MCP_SESSION_HEADER, McpConfigFile, ResolvedSettings, SessionState, SharedAppState,
-    StartupOverrides, ToolCallParams,
+    DEFAULT_MAX_JSONRPC_BODY_BYTES, DEFAULT_MAX_TOOL_OUTPUT_BYTES, DEFAULT_PROTOCOL_VERSION,
+    DEFAULT_WORKSPACE_NAME, JsonRpcError, JsonRpcRequest, JsonRpcResponse, KEEPALIVE_INTERVAL,
+    LogLevel, LoggingNotificationParams, MCP_PROTOCOL_HEADER, MCP_SESSION_HEADER, McpConfigFile,
+    ResolvedSettings, SessionState, SharedAppState, StartupOverrides, ToolCallParams,
 };
 use crate::runtime::{
     execute_request, parse_exec_allow_patterns, parse_exec_arguments, parse_request_arguments,
@@ -102,6 +102,12 @@ pub fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, Bo
     } else {
         file_config.exec_allowlist
     };
+    let max_jsonrpc_body_bytes = file_config
+        .max_jsonrpc_body_bytes
+        .unwrap_or(DEFAULT_MAX_JSONRPC_BODY_BYTES);
+    let max_tool_output_bytes = file_config
+        .max_tool_output_bytes
+        .unwrap_or(DEFAULT_MAX_TOOL_OUTPUT_BYTES);
 
     Ok(ResolvedSettings {
         listen,
@@ -109,6 +115,8 @@ pub fn load_settings(overrides: StartupOverrides) -> Result<ResolvedSettings, Bo
         db_path,
         workspace,
         private_key_path,
+        max_jsonrpc_body_bytes,
+        max_tool_output_bytes,
         exec_allowlist: parse_exec_allow_patterns(&allowlist_inputs)?,
     })
 }
@@ -205,9 +213,24 @@ pub async fn handle_message(state: SharedAppState, request: Request<Body>) -> Re
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
 
-    let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    let body_bytes = match axum::body::to_bytes(
+        request.into_body(),
+        state.settings.max_jsonrpc_body_bytes,
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(err) => {
+            let message = err.to_string();
+            if message.contains("length limit") {
+                return plain_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!(
+                        "JSON-RPC body too large; limit is {} bytes",
+                        state.settings.max_jsonrpc_body_bytes
+                    ),
+                );
+            }
             return json_error_response(
                 None,
                 JSONRPC_INVALID_REQUEST,
@@ -457,18 +480,20 @@ async fn handle_exec_tool(
         }
     };
 
-    let result = match tokio::task::block_in_place(|| run_exec_execution(&execution)) {
-        Ok(result) => result,
-        Err(err) => {
-            return json_response(
-                tool_result_response(
-                    request_id,
-                    tool_error("vaultick.exec failed", json!({"message": err.to_string()})),
-                ),
-                Some(&session_id),
-            );
-        }
-    };
+    let max_output_bytes = state.settings.max_tool_output_bytes;
+    let result =
+        match tokio::task::block_in_place(|| run_exec_execution(&execution, max_output_bytes)) {
+            Ok(result) => result,
+            Err(err) => {
+                return json_response(
+                    tool_result_response(
+                        request_id,
+                        tool_error("vaultick.exec failed", json!({"message": err.to_string()})),
+                    ),
+                    Some(&session_id),
+                );
+            }
+        };
 
     let response = tool_result_response(
         request_id,
@@ -540,9 +565,10 @@ async fn handle_request_tool(
     if use_sse_response {
         let (tx, rx) = mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
         let client = state.client.clone();
+        let max_output_bytes = state.settings.max_tool_output_bytes;
         tokio::spawn(async move {
             let chunk_tx = tx.clone();
-            let result = execute_request(&client, &execution, move |chunk| {
+            let result = execute_request(&client, &execution, max_output_bytes, move |chunk| {
                 let _ = chunk_tx.send(Ok(sse_event(notification_message(
                     "info",
                     "vaultick.request.body",
@@ -585,7 +611,14 @@ async fn handle_request_tool(
         return sse_response(stream, Some(&session_id));
     }
 
-    let result = match execute_request(&state.client, &execution, |_| {}).await {
+    let result = match execute_request(
+        &state.client,
+        &execution,
+        state.settings.max_tool_output_bytes,
+        |_| {},
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             return json_response(

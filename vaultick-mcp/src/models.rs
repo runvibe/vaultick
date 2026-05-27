@@ -16,6 +16,10 @@ pub struct McpConfigFile {
     pub workspace: Option<String>,
     pub private_key: Option<PathBuf>,
     #[serde(default)]
+    pub max_jsonrpc_body_bytes: Option<usize>,
+    #[serde(default)]
+    pub max_tool_output_bytes: Option<usize>,
+    #[serde(default)]
     pub exec_allowlist: Vec<String>,
 }
 
@@ -37,6 +41,8 @@ pub struct ResolvedSettings {
     pub db_path: PathBuf,
     pub workspace: String,
     pub private_key_path: PathBuf,
+    pub max_jsonrpc_body_bytes: usize,
+    pub max_tool_output_bytes: usize,
     pub exec_allowlist: Vec<ExecAllowPattern>,
 }
 
@@ -213,6 +219,8 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "default";
 pub const DEFAULT_DB_DIRECTORY: &str = "databases";
 pub const DEFAULT_DB_FILENAME: &str = "database.db";
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const DEFAULT_MAX_JSONRPC_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
 pub const MCP_PROTOCOL_HEADER: &str = "mcp-protocol-version";
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);

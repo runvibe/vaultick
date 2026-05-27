@@ -468,6 +468,28 @@ impl Vaultick {
         self.get_secret(workspace_ref, key, &private_key_pem)
     }
 
+    pub fn get_secret_bytes_auto<P: AsRef<Path>>(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        ssh_dir: P,
+    ) -> Result<Vec<u8>> {
+        let private_key_pem =
+            self.resolve_auto_private_key_pem_for_workspace(workspace_ref, ssh_dir)?;
+        self.get_secret_bytes(workspace_ref, key, &private_key_pem)
+    }
+
+    pub fn get_secret_raw_bytes_auto<P: AsRef<Path>>(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        ssh_dir: P,
+    ) -> Result<compression::RawSecretBytes> {
+        let private_key_pem =
+            self.resolve_auto_private_key_pem_for_workspace(workspace_ref, ssh_dir)?;
+        self.get_secret_raw_bytes(workspace_ref, key, &private_key_pem)
+    }
+
     pub fn get_secret_metadata(&self, workspace_ref: &str, key: &str) -> Result<SecretMetadata> {
         let key = normalize_secret_key(key)?;
         let conn = self.conn.borrow();

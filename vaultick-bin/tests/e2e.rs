@@ -490,6 +490,96 @@ fn secret_set_file_accepts_binary_content() {
 }
 
 #[test]
+fn secret_set_file_compresses_and_get_output_restores_original_file() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+    let input = env.home.join("archive.txt");
+    let output = env.home.join("restored.txt");
+    let payload = b"vaultick-compressible-payload\n".repeat(256);
+    fs::write(&input, &payload).unwrap();
+
+    let set = env
+        .command()
+        .args([
+            "secret",
+            "set",
+            "archive",
+            "--file",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&set);
+
+    let get = env
+        .command()
+        .args([
+            "secret",
+            "get",
+            "archive",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&get);
+
+    assert_eq!(fs::read(output).unwrap(), payload);
+}
+
+#[test]
+fn secret_get_output_no_uncompress_writes_stored_payload() {
+    let env = TestEnv::new();
+    env.setup_default_rsa();
+    let input = env.home.join("archive.txt");
+    let output = env.home.join("stored.zst");
+    let payload = b"vaultick-raw-zstd-payload\n".repeat(256);
+    fs::write(&input, &payload).unwrap();
+
+    let set = env
+        .command()
+        .args([
+            "secret",
+            "set",
+            "archive",
+            "--file",
+            input.to_str().unwrap(),
+            "--compress",
+            "--compress-level",
+            "22",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&set);
+
+    let get = env
+        .command()
+        .args([
+            "secret",
+            "get",
+            "archive",
+            "--output",
+            output.to_str().unwrap(),
+            "--no-uncompress",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&get);
+
+    let raw = fs::read(output).unwrap();
+    assert_ne!(raw, payload);
+    assert_eq!(
+        vaultick::compression::decompress_secret_payload(
+            &raw,
+            vaultick::compression::Compression::Zstd,
+            Some(payload.len() as u64),
+        )
+        .unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn request_redacts_response_body_and_fails_on_non_success_status() {
     let env = TestEnv::new();
     env.setup_default_rsa();

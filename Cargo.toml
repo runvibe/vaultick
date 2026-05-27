@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1-alpha.4"
+version = "0.0.1-alpha.5"
 license = "MIT"
 repository = "https://github.com/runvibe/vaultick"
 edition = "2024"
@@ -36,5 +36,5 @@ tempfile = "3"
 thiserror = "2.0"
 tokio = "1"
 uuid = { version = "1.23.0", features = ["v4"] }
-vaultick = { version = "0.0.1-alpha.4", path = "vaultick-lib" }
-vaultick-request = { version = "0.0.1-alpha.4", path = "vaultick-request" }
+vaultick = { version = "0.0.1-alpha.5", path = "vaultick-lib" }
+vaultick-request = { version = "0.0.1-alpha.5", path = "vaultick-request" }

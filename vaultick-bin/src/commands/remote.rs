@@ -671,10 +671,10 @@ fn execute_remote_secret_operation(
             overwrite,
         } => {
             let compression = compression.parse::<compression::Compression>()?;
-            vaultick.set_secret_prepared_bytes(
+            vaultick.set_secret_prepared_bytes_owned(
                 workspace_ref,
                 &key,
-                &payload,
+                payload,
                 compression,
                 original_size,
                 overwrite,

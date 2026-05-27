@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -10,7 +11,7 @@ use rsa::pkcs1::{DecodeRsaPrivateKey, DecodeRsaPublicKey};
 use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
 use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use rusqlite::types::Type;
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use rusqlite::{Connection, DatabaseName, ErrorCode, OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
 use ssh_key::PrivateKey as SshPrivateKey;
 use thiserror::Error;
@@ -78,6 +79,8 @@ pub enum VaultickError {
     CertificateInUse,
     #[error("{0}")]
     AutoPrivateKeyLookup(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("{0}")]
     Validation(String),
 }
@@ -309,6 +312,25 @@ impl Vaultick {
         original_size: Option<u64>,
         overwrite: bool,
     ) -> Result<SecretMetadata> {
+        self.set_secret_prepared_bytes_owned(
+            workspace_ref,
+            key,
+            value.to_vec(),
+            compression,
+            original_size,
+            overwrite,
+        )
+    }
+
+    pub fn set_secret_prepared_bytes_owned(
+        &self,
+        workspace_ref: &str,
+        key: &str,
+        value: Vec<u8>,
+        compression: compression::Compression,
+        original_size: Option<u64>,
+        overwrite: bool,
+    ) -> Result<SecretMetadata> {
         validate_compression_metadata(compression, original_size)?;
         let key = normalize_secret_key(key)?;
         let mut conn = self.conn.borrow_mut();
@@ -341,21 +363,26 @@ impl Vaultick {
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
-                    msg: value,
+                    msg: &value,
                     aad: secret_key_aad(&key),
                 },
             )
             .map_err(|err| VaultickError::Crypto(format!("failed to encrypt secret: {err}")))?;
+        drop(value);
+        let ciphertext_len: i64 = ciphertext
+            .len()
+            .try_into()
+            .map_err(|_| VaultickError::Validation("ciphertext is too large".to_string()))?;
 
         let wrapped_keys = public_keys
             .iter()
             .map(|public_key| wrap_secret_key(public_key, &dek))
             .collect::<Result<Vec<_>>>()?;
 
-        let existing_secret = Self::find_secret_by_key(&tx, &workspace.id, &key)?;
+        let existing_secret = Self::find_secret_metadata_by_key(&tx, &workspace.id, &key)?;
         let secret_id = existing_secret
             .as_ref()
-            .map(|secret| secret.metadata.id.clone())
+            .map(|secret| secret.id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         if existing_secret.is_some() {
@@ -367,14 +394,14 @@ impl Vaultick {
             tx.execute(
                 "UPDATE secrets
                  SET nonce = ?1,
-                     ciphertext = ?2,
+                     ciphertext = zeroblob(?2),
                      compression = ?3,
                      original_size = ?4,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                  WHERE id = ?5",
                 params![
                     nonce.to_vec(),
-                    ciphertext,
+                    ciphertext_len,
                     compression.as_str(),
                     original_size.map(i64::try_from).transpose().map_err(|_| {
                         VaultickError::Validation("original_size is too large".to_string())
@@ -389,13 +416,13 @@ impl Vaultick {
         } else {
             tx.execute(
                 "INSERT INTO secrets (id, workspace_id, key, nonce, ciphertext, compression, original_size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, zeroblob(?5), ?6, ?7)",
                 params![
                     secret_id,
                     workspace.id,
                     key,
                     nonce.to_vec(),
-                    ciphertext,
+                    ciphertext_len,
                     compression.as_str(),
                     original_size.map(i64::try_from).transpose().map_err(|_| {
                         VaultickError::Validation("original_size is too large".to_string())
@@ -409,6 +436,18 @@ impl Vaultick {
                 )
             })?;
         }
+
+        let rowid: i64 = tx.query_row(
+            "SELECT rowid FROM secrets WHERE id = ?1",
+            params![secret_id],
+            |row| row.get(0),
+        )?;
+        {
+            let mut blob =
+                tx.blob_open(DatabaseName::Main, "secrets", "ciphertext", rowid, false)?;
+            blob.write_all(&ciphertext)?;
+        }
+        drop(ciphertext);
 
         for (certificate, wrapped_key) in certificates.iter().zip(wrapped_keys.iter()) {
             tx.execute(
@@ -756,6 +795,22 @@ impl Vaultick {
              LIMIT 1",
         )?;
         stmt.query_row(params![workspace_id, key], secret_record_from_row)
+            .optional()
+            .map_err(VaultickError::from)
+    }
+
+    fn find_secret_metadata_by_key(
+        conn: &Connection,
+        workspace_id: &str,
+        key: &str,
+    ) -> Result<Option<SecretMetadata>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, key, created_at, updated_at
+             FROM secrets
+             WHERE workspace_id = ?1 AND key = ?2
+             LIMIT 1",
+        )?;
+        stmt.query_row(params![workspace_id, key], secret_metadata_from_row)
             .optional()
             .map_err(VaultickError::from)
     }
@@ -1583,6 +1638,35 @@ iGYuBTxUVNJpDeKmPMVV4aAQ4toK4wfRwR+FKpx1aOAvk9SbKo+Se3mUOykgytMhqiCEEJ
             .unwrap();
         assert_eq!(raw.payload, prepared.payload);
         assert_eq!(raw.compression, compression::Compression::Zstd);
+    }
+
+    #[test]
+    fn owned_prepared_secret_bytes_roundtrip_to_original_bytes() {
+        let (_dir, store) = new_store();
+        store.create_workspace("team-a").unwrap();
+        store
+            .add_certificate("team-a", "primary", CERT_1, None)
+            .unwrap();
+        let payload = b"large remote payload".repeat(4096);
+        let prepared = compression::prepare_secret_payload(
+            &payload,
+            compression::CompressionMode::Force { level: 10 },
+        )
+        .unwrap();
+
+        store
+            .set_secret_prepared_bytes_owned(
+                "team-a",
+                "archive",
+                prepared.payload,
+                prepared.compression,
+                prepared.original_size,
+                false,
+            )
+            .unwrap();
+
+        let decrypted = store.get_secret_bytes("team-a", "archive", KEY_1).unwrap();
+        assert_eq!(decrypted, payload);
     }
 
     #[test]

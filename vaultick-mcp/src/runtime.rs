@@ -179,7 +179,10 @@ pub fn resolve_exec_execution(
     })
 }
 
-pub fn run_exec_execution(execution: &ExecExecution) -> Result<ExecResult, BoxError> {
+pub fn run_exec_execution(
+    execution: &ExecExecution,
+    max_output_bytes: usize,
+) -> Result<ExecResult, BoxError> {
     let mut child = ProcessCommand::new(&execution.program);
     child.args(&execution.args);
     child.envs(execution.env_vars.iter().map(|(key, value)| (key, value)));
@@ -199,8 +202,10 @@ pub fn run_exec_execution(execution: &ExecExecution) -> Result<ExecResult, BoxEr
     let stdout_redactions = execution.redacted_values.clone();
     let stderr_redactions = execution.redacted_values.clone();
 
-    let stdout_handle = thread::spawn(move || read_redacted_output(stdout, &stdout_redactions));
-    let stderr_handle = thread::spawn(move || read_redacted_output(stderr, &stderr_redactions));
+    let stdout_handle =
+        thread::spawn(move || read_redacted_output(stdout, &stdout_redactions, max_output_bytes));
+    let stderr_handle =
+        thread::spawn(move || read_redacted_output(stderr, &stderr_redactions, max_output_bytes));
 
     let status = child.wait()?;
     let stdout = stdout_handle
@@ -247,6 +252,7 @@ pub async fn collect_request_result(
     response: AsyncResponse,
     request: &ResolvedRequest,
     redacted_values: &[String],
+    max_output_bytes: usize,
     mut on_chunk: impl FnMut(String) + Send,
 ) -> Result<RequestResult, BoxError> {
     let status = response.status();
@@ -267,8 +273,8 @@ pub async fn collect_request_result(
     while let Some(next) = stream.next().await {
         let chunk = next?;
         if !chunk.is_empty() {
+            extend_with_limit(&mut body_bytes, &chunk, max_output_bytes)?;
             on_chunk(String::from_utf8_lossy(&chunk).into_owned());
-            body_bytes.extend_from_slice(&chunk);
         }
     }
 
@@ -285,6 +291,7 @@ pub async fn collect_request_result(
 pub async fn execute_request(
     client: &vaultick_request::AsyncClient,
     execution: &RequestExecution,
+    max_output_bytes: usize,
     mut on_chunk: impl FnMut(String) + Send,
 ) -> Result<RequestResult, BoxError> {
     let response = execute_async_with_client(client, &execution.request).await?;
@@ -292,6 +299,7 @@ pub async fn execute_request(
         response,
         &execution.request,
         &execution.redacted_values,
+        max_output_bytes,
         move |chunk| {
             on_chunk(chunk);
         },
@@ -339,6 +347,7 @@ pub fn command_allowed(allowlist: &[ExecAllowPattern], requested_tokens: &[Strin
 fn read_redacted_output(
     mut reader: impl Read,
     redacted_values: &[String],
+    max_output_bytes: usize,
 ) -> Result<Vec<u8>, io::Error> {
     let mut redactor = vaultick_request::Redactor::new(redacted_values);
     let mut buffer = [0_u8; 8192];
@@ -350,11 +359,24 @@ fn read_redacted_output(
             break;
         }
 
-        output.extend(redactor.redact_chunk(&buffer[..bytes_read]));
+        let redacted = redactor.redact_chunk(&buffer[..bytes_read]);
+        extend_with_limit(&mut output, &redacted, max_output_bytes)?;
     }
 
-    output.extend(redactor.finish());
+    let tail = redactor.finish();
+    extend_with_limit(&mut output, &tail, max_output_bytes)?;
     Ok(output)
+}
+
+fn extend_with_limit(output: &mut Vec<u8>, chunk: &[u8], limit: usize) -> Result<(), io::Error> {
+    if output.len().saturating_add(chunk.len()) > limit {
+        return Err(io::Error::other(format!(
+            "tool output exceeded limit of {limit} bytes"
+        )));
+    }
+
+    output.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn normalize_secret_key(key: &str) -> Result<String, io::Error> {

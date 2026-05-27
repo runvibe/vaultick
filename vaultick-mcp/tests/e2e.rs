@@ -99,6 +99,13 @@ impl TestEnv {
             token: "test-token".to_string(),
         }
     }
+
+    fn write_config(&self, contents: &str) -> PathBuf {
+        let path = self.home.join("vaultick-mcp.yaml");
+        fs::create_dir_all(&self.home).unwrap();
+        fs::write(&path, contents).unwrap();
+        path
+    }
 }
 
 struct ChildGuard {
@@ -198,6 +205,37 @@ async fn mcp_rejects_missing_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_rejects_jsonrpc_body_over_configured_limit() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ntoken: {token}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nmax_jsonrpc_body_bytes: 16\nexec_allowlist: []\n",
+        listen = listen_addr,
+        token = env.token,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    ));
+    let _guard = spawn_mcp_from_config(&env, &listen_addr, &config_path).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{listen_addr}/mcp"))
+        .header("authorization", format!("Bearer {}", env.token))
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("JSON-RPC body too large")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_exec_respects_allowlist() {
     let env = TestEnv::new();
     let listen_addr = free_addr();
@@ -231,6 +269,51 @@ async fn mcp_exec_respects_allowlist() {
             .as_str()
             .unwrap()
             .contains("not allowed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_exec_rejects_output_over_configured_limit() {
+    let env = TestEnv::new();
+    let listen_addr = free_addr();
+    let config_path = env.write_config(&format!(
+        "listen: {listen}\ntoken: {token}\ndb: {db}\nworkspace: default\nprivate_key: {key}\nmax_tool_output_bytes: 8\nexec_allowlist:\n  - printf\n",
+        listen = listen_addr,
+        token = env.token,
+        db = env.db_path.display(),
+        key = env.private_key_path.display(),
+    ));
+    let _guard = spawn_mcp_from_config(&env, &listen_addr, &config_path).await;
+    let (client, session_id) = initialize_session(&env, &listen_addr).await;
+
+    let response = client
+        .post(format!("http://{listen_addr}/mcp"))
+        .header("mcp-session-id", &session_id)
+        .header("mcp-protocol-version", "2025-06-18")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "vaultick.exec",
+                "arguments": {
+                    "program": "printf",
+                    "args": ["123456789"],
+                    "stream": false
+                }
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["isError"], true);
+    assert!(
+        body["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tool output exceeded limit of 8 bytes")
     );
 }
 
@@ -459,6 +542,22 @@ async fn spawn_mcp_process(env: &TestEnv, listen_addr: &str, extra_args: &[&str]
         command.arg(arg);
     }
     let child = command.spawn().unwrap();
+    wait_for_server(listen_addr, child).await
+}
+
+async fn spawn_mcp_from_config(
+    env: &TestEnv,
+    listen_addr: &str,
+    config_path: &PathBuf,
+) -> ChildGuard {
+    let child = Command::new(binary())
+        .arg("--config")
+        .arg(config_path)
+        .env("HOME", &env.home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     wait_for_server(listen_addr, child).await
 }
 
